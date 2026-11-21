@@ -294,6 +294,8 @@ The backup contains all passwords and API keys: store it encrypted.
 
 ## Troubleshooting
 
+`bash scripts/report.sh` collects the state of both stacks into `/tmp/misp-zsazsa-report.txt`: containers, restarts, networks, effective settings, MISP workers, Redis and database figures, and the recent errors of every component. It only reads, and masks passwords and keys; hostnames and addresses stay in, so read it before you share it.
+
 ### Where the logs are
 
 | Component | Command or file |
