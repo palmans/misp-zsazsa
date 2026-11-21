@@ -42,6 +42,7 @@ misp-docker/logs/
 misp-docker/ssl/
 misp-docker/custom/
 misp-docker/env.hcl
+misp-docker/exim-macros
 misp-docker/docker-compose.override.yml
 
 # --- misp-scraper config (contains MISP API key) ---

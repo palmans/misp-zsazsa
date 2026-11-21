@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # folder|repository|branch|paths kept (relative to the folder)
 COMPONENTS=(
-    "misp-docker|https://github.com/MISP/misp-docker.git|master|.env ssl configs files gnupg logs custom env.hcl docker-compose.override.yml"
+    "misp-docker|https://github.com/MISP/misp-docker.git|master|.env ssl configs files gnupg logs custom env.hcl docker-compose.override.yml exim-macros"
     "misp-scraper|https://github.com/cudeso/misp-scraper.git|main|scraper.py docker/.env docker/config"
     "zsazsa|https://github.com/zsazsa-project/zsazsa.git|main|docker/.env docker/volumes"
 )

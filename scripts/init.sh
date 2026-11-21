@@ -99,7 +99,7 @@ case "${PROXY_CERT_VALID:-true}" in
     *) VERIFYCERT=False ;;
 esac
 
-chmod +x "$ROOT/deploy/nginx/05-zsazsa.sh" "$ROOT"/scripts/*.sh
+chmod +x "$ROOT/deploy/nginx/05-zsazsa.sh" "$ROOT/deploy/misp/customize_misp.sh" "$ROOT"/scripts/*.sh
 
 # --- misp-docker -------------------------------------------------------------
 
@@ -146,6 +146,20 @@ for var in $(grep -oE '(^|[^$])\$\{[A-Za-z0-9_]+\}' "$MISP_DIR/docker-compose.ym
     grep -qE "^$var=" "$MISP_ENV" || echo "$var=" >> "$MISP_ENV"
 done
 chmod 600 "$MISP_ENV"
+
+# Mail relay. With a user and password but no aliases, the mail container
+# would not use them at all: default the aliases to the relay itself.
+if [[ -n "$(get_env "$MISP_ENV" SMARTHOST_USER)" && -z "$(get_env "$MISP_ENV" SMARTHOST_ALIASES)" ]]; then
+    set_env "$MISP_ENV" SMARTHOST_ALIASES "$(get_env "$MISP_ENV" SMARTHOST_ADDRESS)"
+fi
+# exim only sends the relay password over TLS, unless this is true.
+{
+    echo "# Written by scripts/init.sh from SMARTHOST_ALLOW_PLAINTEXT_AUTH in .env"
+    if [[ "$(get_env "$MISP_ENV" SMARTHOST_ALLOW_PLAINTEXT_AUTH)" == true ]]; then
+        echo "AUTH_CLIENT_ALLOW_NOTLS_PASSWORDS = 1"
+    fi
+} > "$MISP_DIR/exim-macros"
+chmod 644 "$MISP_DIR/exim-macros"
 
 ADMIN_KEY="$(get_env "$MISP_ENV" ADMIN_KEY)"
 REDIS_PASSWORD="$(get_env "$MISP_ENV" REDIS_PASSWORD)"

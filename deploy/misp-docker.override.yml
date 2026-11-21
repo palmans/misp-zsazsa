@@ -7,6 +7,14 @@ services:
       # minutes. Failed checks in this period do not count; the container is
       # healthy as soon as PHP-FPM listens, so later starts are not slowed down.
       start_period: 15m
+    volumes:
+      # Run at the end of every start: force_https, PHP session hardening.
+      - "../deploy/misp/customize_misp.sh:/custom/files/customize_misp.sh:ro"
+
+  mail:
+    volumes:
+      # Extra exim macros, written by scripts/init.sh (SMARTHOST_ALLOW_PLAINTEXT_AUTH).
+      - "./exim-macros:/etc/exim4/_docker_additional_macros:ro"
 
   misp-nginx:
     # No ports on the Docker host: nginx has an address of its own on the LAN.
