@@ -20,7 +20,8 @@ set_php() {
         echo "$key = $value" >> "$ini"
     fi
 }
-for ini in /etc/php/*/fpm/php.ini; do
+# The CLI gets the same values, so cake's security audit agrees with the web server.
+for ini in /etc/php/*/fpm/php.ini /etc/php/*/cli/php.ini; do
     set_php "$ini" session.use_strict_mode 1
     set_php "$ini" session.sid_bits_per_character 5
 done
