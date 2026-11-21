@@ -137,6 +137,14 @@ set_secret "$MISP_ENV" ADMIN_KEY 40
 set_secret "$MISP_ENV" ENCRYPTION_KEY 32
 set_secret "$MISP_ENV" GPG_PASSPHRASE 32
 set_secret "$MISP_ENV" SUPERVISOR_PASSWORD 32
+# Optional variables docker-compose.yml uses without a default. Empty behaves
+# the same as unset, without a warning per variable on every compose command.
+if ! grep -q '^# --- Optional settings left empty' "$MISP_ENV"; then
+    printf '\n# --- Optional settings left empty (by scripts/init.sh): set a value here or remove the line ---\n' >> "$MISP_ENV"
+fi
+for var in $(grep -oE '(^|[^$])\$\{[A-Za-z0-9_]+\}' "$MISP_DIR/docker-compose.yml" | sed -E 's/.*\$\{([A-Za-z0-9_]+)\}/\1/' | sort -u); do
+    grep -qE "^$var=" "$MISP_ENV" || echo "$var=" >> "$MISP_ENV"
+done
 chmod 600 "$MISP_ENV"
 
 ADMIN_KEY="$(get_env "$MISP_ENV" ADMIN_KEY)"

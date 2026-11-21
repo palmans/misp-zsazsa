@@ -343,7 +343,7 @@ Expected: with `ipvlan` and `macvlan`, the host and its containers on the LAN ne
 - *Too many redirects* — the proxy forwards to the HTTP port; use the HTTPS port.
 - *Login form says the request was black-holed / CSRF errors* — the browser URL differs from `BASE_URL` in `misp-docker/.env`, or the proxy does not pass the `Host` header.
 - *Uploads fail* — raise `client_max_body_size` on the proxy (and `NGINX_CLIENT_MAX_BODY_SIZE`/`PHP_UPLOAD_MAX_FILESIZE` in `misp-docker/.env`).
-- *The first start takes long / misp-core unhealthy* — the database is initialised on the first start; follow `docker compose logs -f misp-core`. MariaDB reserves `INNODB_BUFFER_POOL_SIZE` (2 GB by default): lower it in `misp-docker/.env` on small hosts.
+- *The first start takes long / misp-core unhealthy* — the database is initialised on the first start; follow `docker compose logs -f misp-core` until *MISP is now live*, then run `docker compose up -d` again if misp-nginx was left in the *Created* state. The override gives misp-core 15 minutes before a failed health check counts. MariaDB reserves `INNODB_BUFFER_POOL_SIZE` (2 GB by default): lower it in `misp-docker/.env` on small hosts.
 
 ### zsazsa
 

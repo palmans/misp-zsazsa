@@ -1,6 +1,13 @@
 # Deployment overrides for misp-docker, loaded through COMPOSE_FILE in
 # misp-docker/.env (written by scripts/init.sh). All values come from that .env.
 services:
+  misp-core:
+    healthcheck:
+      # The first start (database, updates, galaxies, warninglists) takes
+      # minutes. Failed checks in this period do not count; the container is
+      # healthy as soon as PHP-FPM listens, so later starts are not slowed down.
+      start_period: 15m
+
   misp-nginx:
     # No ports on the Docker host: nginx has an address of its own on the LAN.
     ports: !reset []
