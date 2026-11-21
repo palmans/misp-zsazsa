@@ -215,9 +215,9 @@ If you restrict access with an access list on the reverse proxy, allow the Docke
 2. **Taxonomies** — under *Event Actions → List Taxonomies*, enable at least `tlp`, `workflow` and `admiralty-scale`.
 3. **zsazsa** — open `https://<MISP_HOSTNAME>/zsazsa/`. As a MISP site admin you get zsazsa's setup wizard (also at `/zsazsa/config/setup`): organisation, collection sources, AI, focus points and notifications. AI features need an OpenAI API key or a local OpenAI-compatible endpoint (e.g. Ollama).
 4. **Single sign-on** — in zsazsa, *Settings → System → Single sign-on*: save once (zsazsa then detects MISP's cookie name) and press **Test single sign-on**. Redis host, password and database are already filled in by `init.sh`.
-5. **Dedicated API keys (recommended)** — zsazsa and misp-scraper start with the MISP admin key. In MISP, create a user for each (*Administration → Add User*, your organisation, a role that can add and modify events, tag them and create tags, such as *Org Admin*, plus publishing for zsazsa), create an auth key for each, and put them in:
-   - `zsazsa/docker/volumes/config/__init__.py`: `MISP_KEY` and `MISP_WEBAPP_KEY` (or via zsazsa's Settings page)
-   - `zsazsa/docker/volumes/scraper-config/scraper.py`: `misp_key`
+5. **Dedicated API keys (recommended)** — zsazsa and misp-scraper start with the key of the MISP administrator, a site admin: whoever obtains it controls all of MISP, and everything both tools do is logged under the administrator's name. In MISP, create a user for each (*Administration → Add User*: your organisation, role *Org Admin* rather than *Site Admin* — they create events, create and attach tags, and zsazsa publishes — and "Send credentials automatically" off). The e-mail address only has to be unique. Then add an auth key per user (*Administration → List Users →* the user *→ Auth keys → Add authentication key*), optionally limited with *Allowed IPs*: the Docker host's address for zsazsa (it calls MISP through the reverse proxy), misp-docker's network (e.g. `172.21.0.0/16`, see `docker network inspect misp-docker_default`) for misp-scraper. Put the keys in:
+   - zsazsa: *Settings → Connections* (`MISP_WEBAPP_KEY`) and *Sources → MISP scraper* (`MISP_KEY`), or `zsazsa/docker/volumes/config/__init__.py`
+   - misp-scraper: `misp_key` in `zsazsa/docker/volumes/scraper-config/scraper.py`
 
    Then restart: `cd zsazsa/docker && docker compose restart`.
 6. **Feeds** — edit `zsazsa/docker/volumes/scraper-config/feedlist.json` and restart `scraper-cron`, or trigger a run now (see below).
