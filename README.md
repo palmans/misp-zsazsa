@@ -77,7 +77,7 @@ The three folders `misp-docker/`, `misp-scraper/` and `zsazsa/` are unmodified c
 - A Linux Docker host with **Docker Engine** and the **Compose plugin 2.24 or later** (`docker compose version`), plus `git` and `openssl`. A Docker host in a Proxmox LXC container works (use the `ipvlan` driver, see below).
 - A **free address on the LAN** for `misp-nginx`, outside the DHCP pool of your router.
 - A **reverse proxy** that terminates TLS for MISP's hostname, with a DNS record for that hostname pointing at it. The reverse proxy must run on **another machine than the Docker host** (see [Troubleshooting](#the-docker-host-cannot-reach-misp_lan_ip)).
-- At least **4 GB RAM** and 20 GB of disk for a small installation.
+- At least **6 GB RAM** for the whole stack (MISP with MariaDB alone uses about 2.5 GB with the default `INNODB_BUFFER_POOL_SIZE=2048M`; zsazsa, misp-scraper and the image builds need the rest) and 20 GB of disk. On a smaller host, lower `INNODB_BUFFER_POOL_SIZE` in `misp-docker/.env`.
 - Outbound internet access for the containers (image pulls, feeds, scraped sites, optionally the OpenAI API).
 
 ## What you must configure

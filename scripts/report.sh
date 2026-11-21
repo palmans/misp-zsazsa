@@ -61,8 +61,11 @@ mask() {
     for s in MISP.baseurl MISP.external_baseurl MISP.live MISP.host_org_id MISP.email Security.rest_client_baseurl \
         Security.csp_enforce Security.require_password_confirmation Session.defaults Session.timeout \
         Session.cookieTimeout Session.autoRegenerate SimpleBackgroundJobs.enabled Plugin.Enrichment_services_url; do
-        printf '%s = %s\n' "$s" "$(cake Admin getSetting "$s" | tr -d '\n' | tail -c 200)"
+        value="$(cake Admin getSetting "$s" | tr -d '\n' | grep -oE '"value": *("[^"]*"|[^,}]*)' | head -n 1)"
+        printf '%s = %s\n' "$s" "${value#*: }"
     done
+    # Sessions (single sign-on) belong in db0; MISP's jobs use db1, its cache db13.
+    printf 'PHP sessions in Redis db0: %s\n' "$(MISP exec -T redis sh -c 'valkey-cli -a "$REDIS_PASSWORD" --no-auth-warning -n 0 --scan --pattern "PHPREDIS_SESSION:*" | wc -l' 2>&1)"
     MISP exec -T misp-core sh -c 'grep -hE "^session\.(save_handler|save_path|cookie_secure|cookie_samesite)" /etc/php/*/fpm/php.ini' 2>&1
 
     section "MISP workers (supervisor)"
