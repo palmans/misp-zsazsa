@@ -1,0 +1,26 @@
+# Deployment overrides for zsazsa/docker, loaded through COMPOSE_FILE in
+# zsazsa/docker/.env (written by scripts/init.sh), after
+# docker-compose.misp-docker.yml has put the containers on misp-docker's network.
+x-misp-via-proxy: &misp-via-proxy
+  # MISP's public address resolves to the reverse proxy, with or without DNS.
+  extra_hosts:
+    - "${MISP_HOSTNAME:?Missing MISP_HOSTNAME in .env, run scripts/init.sh}:${PROXY_IP:?Missing PROXY_IP in .env, run scripts/init.sh}"
+
+services:
+  webapp:
+    <<: *misp-via-proxy
+    # Reached only by misp-nginx, as http://zsazsa:5000 on misp-docker's network.
+    ports: !reset []
+
+  analyser:
+    <<: *misp-via-proxy
+
+  imap-collector:
+    <<: *misp-via-proxy
+
+  # on-failure is not restarted when the Docker host reboots.
+  scraper-subscribe:
+    restart: unless-stopped
+
+  scraper-cron:
+    restart: unless-stopped

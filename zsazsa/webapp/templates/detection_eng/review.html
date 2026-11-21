@@ -1,0 +1,566 @@
+{% extends "base.html" %}
+{% from "_product_actions.html" import approval_form with context %}
+{% from "_macros.html" import audience_badges %}
+{% from "_sort_header.html" import sort_th with context %}
+
+{% block title %}Detection engineering requests | zsazsa CTI{% endblock %}
+{% block page_title %}Detection engineering requests{% endblock %}
+{% block head_extra %}{% include "_rulezet_viewer_assets.html" %}{% endblock %}
+
+{% macro bullets(items) %}
+  {% if items %}<ul class="mb-0 ps-3">{% for i in items %}<li style="font-size:.82rem;">{{ i | md_inline }}</li>{% endfor %}</ul>
+  {% else %}<span class="text-muted" style="font-size:.82rem;">none recorded</span>{% endif %}
+{% endmacro %}
+
+{% macro status_badge_class(status) %}{%- if status == 'Active' -%}bg-success-subtle text-success-emphasis
+  {%- elif status == 'In Dev' -%}bg-primary-subtle text-primary-emphasis
+  {%- elif status == 'In Test' -%}bg-warning-subtle text-warning-emphasis
+  {%- elif status == 'Retired' -%}bg-light text-muted border
+  {%- else -%}bg-secondary-subtle text-secondary-emphasis{%- endif -%}{% endmacro %}
+
+{% block content %}
+{% import "_charts.html" as charts with context %}
+{% set priority_colors = {'Critical': 'var(--priority-must-fg)', 'High': 'var(--accent-orange)',
+                          'Medium': 'var(--accent-blue)', 'Low': 'var(--neutral-400)'} %}
+{% set count = namespace(waiting=0, draft=0, approved=0, rejected=0, testing=0, active=0) %}
+{% for d in ders %}
+  {% if d.review_state == 'pending-review' %}{% set count.waiting = count.waiting + 1 %}
+  {% elif d.review_state == 'draft' %}{% set count.draft = count.draft + 1 %}
+  {% elif d.review_state == 'approved' %}{% set count.approved = count.approved + 1 %}
+  {% elif d.review_state == 'rejected' %}{% set count.rejected = count.rejected + 1 %}{% endif %}
+  {% if d.status == 'In Test' %}{% set count.testing = count.testing + 1 %}{% elif d.status == 'Active' %}{% set count.active = count.active + 1 %}{% endif %}
+{% endfor %}
+{% set filtered = state_filter or tlp_filter or audience_filter or priority_filter %}
+
+<section class="record-hero record-hero-compact rise mb-3">
+  <div class="hero-main">
+    <span class="hero-icon" aria-hidden="true"><i class="fas fa-crosshairs"></i></span>
+    <div class="record-kpis">
+      <div class="record-kpi"><b>{{ ders | length }}</b><span>request{{ 's' if ders | length != 1 }}{{ ' shown' if filtered }}</span></div>
+      <a href="{{ charts.filtered_url('state', 'pending-review', state_filter) }}" class="record-kpi{{ ' warn' if count.waiting }}"
+         title="{{ 'Show all again' if state_filter == 'pending-review' else 'Show only those waiting for review' }}"><b>{{ count.waiting }}</b><span>waiting for review</span></a>
+      {% if count.draft %}<div class="record-kpi"><b>{{ count.draft }}</b><span>draft{{ 's' if count.draft != 1 }}</span></div>{% endif %}
+      <div class="record-kpi"><b>{{ count.approved }}</b><span>approved</span></div>
+      <div class="record-kpi"><b>{{ count.testing }}</b><span>in test</span></div>
+      <div class="record-kpi"><b>{{ count.active }}</b><span>active</span></div>
+    </div>
+    <div class="hero-actions">
+      <a href="{{ url_for('detection_eng.wizard_new') }}" class="btn btn-sm btn-hero"><i class="fas fa-plus me-1"></i> New detection engineering request</a>
+      <button type="button" class="btn btn-sm btn-hero-ghost" data-bs-toggle="collapse" data-bs-target="#product-flow"
+              aria-expanded="false" aria-controls="product-flow">
+        <i class="fas fa-circle-question me-1"></i> How a request is made
+      </button>
+    </div>
+  </div>
+  {% if state_counts or status_counts or priority_counts or tlp_counts or audience_counts %}
+  <div class="record-panel list-stats">
+    <div>{{ charts.mix('Review state', state_counts, charts.review_colors, param='state', selected=state_filter) }}</div>
+    <div>{{ charts.mix('Engineering', status_counts, charts.status_colors) }}</div>
+    <div>{{ charts.mix('Priority', priority_counts, priority_colors, param='priority', selected=priority_filter) }}</div>
+    <div>{{ charts.mix('TLP', tlp_counts, charts.tlp_colors, param='tlp', selected=tlp_filter) }}</div>
+    <div style="flex-grow:1.6;">{{ charts.mix('Audience', audience_counts, param='audience', selected=audience_filter, top=4) }}</div>
+  </div>
+  {% endif %}
+</section>
+
+<form method="get" class="card content-card list-filters record-filters rise rise-1 mb-4">
+  {{ charts.filter_select('state', 'Review state', 'fa-list-check', 'All states', review_states, state_filter) }}
+  {{ charts.filter_select('tlp', 'TLP', 'fa-traffic-light', 'All TLP levels', tlp_choices, tlp_filter) }}
+  {{ charts.filter_select('audience', 'Audience', 'fa-users', 'All audiences', audience_choices, audience_filter) }}
+  {{ charts.filter_select('priority', 'Priority', 'fa-flag', 'All priorities', priorities, priority_filter) }}
+  {% if filtered %}
+  <a href="{{ url_for('detection_eng.review') }}" class="btn btn-xs btn-outline-secondary ms-auto">Clear</a>
+  {% endif %}
+</form>
+
+{% include "detection_eng/_flow.html" %}
+
+{# The engineering board. Its script finds the columns, cards, spinner and
+   count by their kanban-* classes, so those stay as they are. #}
+{% set kanban_statuses = [('Pending', 'var(--neutral-400)'), ('In Dev', 'var(--accent-blue)'), ('In Test', 'var(--accent-orange)'),
+                          ('Active', 'var(--accent-green)'), ('Retired', 'var(--text-muted)')] %}
+<div class="card content-card mb-4 rise rise-2">
+  <div class="card-header d-flex justify-content-between align-items-center gap-2 flex-wrap">
+    <span><i class="fas fa-table-columns me-2"></i>Engineering board</span>
+    <span class="small text-muted fw-normal">Drag a request to change its status. Leaving Pending needs approval first.</span>
+  </div>
+  <div class="card-body p-2">
+    <div id="kanban-msg" class="alert alert-danger py-2 px-3 mb-2" style="display:none;font-size:.85rem;"></div>
+    <div class="kanban-board eng-board">
+      {% for col_status, color in kanban_statuses %}
+      {% set cards = ders | selectattr('status', 'equalto', col_status) | list %}
+      {% if col_status == 'Pending' %}{% set cards = cards | rejectattr('review_state', 'equalto', 'rejected') | list %}{% endif %}
+      <div class="kanban-col" data-status="{{ col_status }}">
+        <div class="kanban-col-header"><i style="background:{{ color }};"></i>{{ col_status }}<span class="badge">{{ cards | length }}</span></div>
+        <div class="kanban-cards">
+          {% for d in cards %}
+          {% set can_drag = d.review_state == 'approved' %}
+          <div class="kanban-card{{ ' locked' if not can_drag }}"
+               draggable="{{ 'true' if can_drag else 'false' }}"
+               data-id="{{ d.uuid }}"
+               data-update-url="{{ url_for('detection_eng.status_update', id=d.uuid) }}">
+            <div class="d-flex justify-content-between align-items-center">
+              <a href="{{ url_for('detection_eng.detail', id=d.uuid) }}" class="req-id-badge text-decoration-none">{{ d.der_id }}</a>
+              <span class="kanban-card-spin" style="display:none;"><i class="fas fa-spinner fa-spin fa-xs"></i></span>
+              <span class="kanban-card-icon">
+                {% if d.review_state == 'draft' %}<i class="fas fa-pencil fa-xs" style="color:var(--neutral-600);" title="Review: draft"></i>
+                {% elif d.review_state == 'pending-review' %}<i class="fas fa-inbox fa-xs" style="color:var(--accent-orange);" title="Review: pending review"></i>
+                {% elif d.review_state == 'approved' %}<i class="fas fa-check-circle fa-xs" style="color:var(--status-active-fg);" title="Review: approved"></i>
+                {% endif %}
+              </span>
+            </div>
+            <div class="t" title="{{ d.title }}">{{ d.title }}</div>
+            {% if d.review_state in ('draft', 'pending-review') %}
+            <button type="button" class="btn btn-xs btn-outline-warning approval-open mt-1"
+                    data-target="der-preview-{{ d.uuid }}" aria-controls="der-preview-{{ d.uuid }}"
+                    aria-expanded="false" title="Review and approve this request before tracking engineering status">
+              <i class="fas fa-gavel me-1"></i>Approve first
+            </button>
+            {% endif %}
+          </div>
+          {% else %}
+          <div class="eng-empty">{{ 'Drop a request here' if col_status != 'Pending' else 'None pending' }}</div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endfor %}
+
+      {% set rejected = ders | selectattr('review_state', 'equalto', 'rejected') | list %}
+      <div class="kanban-col">
+        <div class="kanban-col-header"><i style="background:var(--accent-red);"></i>Rejected<span class="badge">{{ rejected | length }}</span></div>
+        <div class="kanban-cards">
+          {% for d in rejected %}
+          <div class="kanban-card locked" draggable="false" data-id="{{ d.uuid }}" style="opacity:.75;">
+            <div class="d-flex justify-content-between align-items-center">
+              <a href="{{ url_for('detection_eng.detail', id=d.uuid) }}" class="req-id-badge text-decoration-none">{{ d.der_id }}</a>
+              <i class="fas fa-ban fa-xs" style="color:var(--status-rejected-fg);" title="Review: rejected"></i>
+            </div>
+            <div class="t" title="{{ d.title }}">{{ d.title }}</div>
+          </div>
+          {% else %}
+          <div class="eng-empty">None rejected</div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% set lanes = [('pending-review', 'Waiting for review', 'Approve and publish, or reject', 'var(--accent-blue)'),
+                ('draft', 'Draft', 'Submit for review when it is ready', 'var(--neutral-500)'),
+                ('approved', 'Approved', 'Published; their engineering is tracked on the board', 'var(--accent-green)'),
+                ('rejected', 'Rejected', 'Kept until deleted', 'var(--accent-red)')] %}
+{% set steps = {'draft': ['now', '', ''], 'pending-review': ['done', 'now', ''], 'approved': ['done', 'done', 'now'],
+                'rejected': ['done', 'done', '']} %}
+<div class="card content-card rise rise-3">
+  <div class="card-body p-0">
+    {% if ders %}
+    <div class="table-responsive">
+    <table class="table table-hover zsazsa-table req-table product-table mb-0">
+      <thead>
+        <tr>
+          {{ sort_th('DER', 'id', sort, dir, 'detection_eng.review', '120px') }}
+          {{ sort_th('Title', 'title', sort, dir, 'detection_eng.review') }}
+          <th>Technique(s)</th>
+          <th>Priority</th>
+          <th>Status</th>
+          {{ sort_th('State', 'state', sort, dir, 'detection_eng.review') }}
+          {{ sort_th('Published', 'date', sort, dir, 'detection_eng.review') }}
+          <th class="text-end">Actions</th>
+        </tr>
+      </thead>
+      {% for state, lane, hint, color in lanes %}
+      {# A state none of the lanes has, set by hand in MISP, is shown as a draft rather than not at all. #}
+      {% set others = lanes | map(attribute=0) | reject('equalto', 'draft') | list %}
+      {% set rows = (ders | selectattr('review_state', 'equalto', state) | list) if state != 'draft'
+                     else (ders | rejectattr('review_state', 'in', others) | list) %}
+      {% if rows %}
+      <tbody>
+        <tr class="lane-head">
+          <th colspan="8">
+            <span class="lane-mark" style="background:{{ color }};"></span>
+            <span class="lane-name">{{ lane }}</span>
+            <span class="lane-count">{{ rows | length }} request{{ 's' if rows | length != 1 }}</span>
+            <span class="lane-hint">{{ hint }}</span>
+          </th>
+        </tr>
+        {% for d in rows %}
+        {# ── Main row ── #}
+        <tr id="der-row-{{ d.uuid }}" class="{{ 'draft-row' if state == 'pending-review' }}">
+          <td style="white-space:nowrap;">
+            <a href="{{ url_for('detection_eng.detail', id=d.uuid) }}" class="text-decoration-none">
+              <span class="req-id-badge">{{ d.der_id }}</span>
+            </a>
+          </td>
+          <td>
+            <a href="{{ url_for('detection_eng.detail', id=d.uuid) }}" class="title{{ ' untitled' if not d.title }}">{{ d.title or 'No title' }}</a>
+            {{ audience_badges(d.audience, limit=3) }}
+          </td>
+          <td>
+            {% for t in d.technique[:3] %}<span class="badge bg-secondary me-1" style="font-size:.68rem;">{{ t }}</span>{% endfor %}
+            {% if d.technique | length > 3 %}<span class="text-muted small">+{{ d.technique | length - 3 }}</span>{% endif %}
+            {% if not d.technique %}<span class="text-muted small">-</span>{% endif %}
+          </td>
+          <td><span class="text-muted small">{{ d.priority or '-' }}</span></td>
+          <td>
+            {% if d.status %}
+            <span class="badge der-status-cell {{ status_badge_class(d.status) }}" data-id="{{ d.uuid }}">{{ d.status }}</span>
+            {% else %}
+            <span class="text-muted small der-status-cell" data-id="{{ d.uuid }}">-</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="status-steps" aria-hidden="true" style="max-width:6rem;">
+              {% for step in steps[state] %}<i class="{{ step }}"></i>{% endfor %}
+            </div>
+            {% if d.review_state == 'approved' %}<span class="badge bg-success">approved</span>
+            {% elif d.review_state == 'rejected' %}<span class="badge bg-danger">rejected</span>
+            {% elif d.review_state == 'pending-review' %}<span class="badge bg-info text-dark">pending review</span>
+            {% else %}<span class="badge bg-secondary">{{ d.review_state }}</span>{% endif %}
+          </td>
+          <td style="white-space:nowrap;">{{ d.published_at.strftime('%Y-%m-%d') if d.published_at else '-' }}</td>
+          <td class="text-end">
+            <div class="d-inline-flex flex-nowrap align-items-center justify-content-end gap-2">
+              <span class="d-inline-flex flex-nowrap gap-1">
+                {% if d.review_state == 'approved' %}
+                <button type="button" class="btn btn-xs btn-outline-secondary preview-toggle-btn"
+                        data-target="der-preview-{{ d.uuid }}" aria-controls="der-preview-{{ d.uuid }}"
+                        aria-expanded="false" title="Preview">
+                  <i class="fas fa-fw fa-eye" aria-hidden="true"></i>
+                </button>
+                {% endif %}
+                <button type="button" class="btn btn-xs btn-outline-secondary feedback-btn"
+                        data-action="{{ url_for('detection_eng.add_feedback', id=d.uuid) }}" data-der-id="{{ d.der_id }}"
+                        data-bs-toggle="modal" data-bs-target="#feedback-modal" title="Give feedback">
+                  <i class="fas fa-comment-dots"></i>
+                </button>
+                <a href="{{ url_for('detection_eng.pdf', id=d.uuid) }}" class="btn btn-xs btn-outline-secondary" title="Download PDF">
+                  <i class="fas fa-file-pdf"></i>
+                </a>
+                {% if d.review_state == 'approved' %}
+                <form method="post" action="{{ url_for('detection_eng.resend', id=d.uuid) }}" class="d-inline">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <button type="submit" class="btn btn-xs btn-outline-primary" title="Resend to stakeholders">
+                    <i class="fas fa-paper-plane"></i>
+                  </button>
+                </form>
+                {% else %}
+                <span class="btn btn-xs btn-outline-primary btn-ghost" aria-hidden="true"><i class="fas fa-paper-plane"></i></span>
+                {% endif %}
+              </span>
+              <span class="vr"></span>
+              <span class="d-inline-flex flex-nowrap gap-1">
+                {% if d.review_state == 'approved' %}
+                <span class="btn btn-xs btn-outline-secondary btn-ghost" aria-hidden="true"><i class="fas fa-pen"></i></span>
+                <span class="btn btn-xs btn-outline-danger btn-ghost" aria-hidden="true"><i class="fas fa-trash"></i></span>
+                {% else %}
+                <a href="{{ url_for('detection_eng.wizard_edit', id=d.uuid) }}" class="btn btn-xs btn-outline-secondary" title="Edit">
+                  <i class="fas fa-pen"></i>
+                </a>
+                <form method="post" action="{{ url_for('detection_eng.delete', id=d.uuid) }}" data-busy="Deleting…"
+                      class="d-inline"
+                      data-submit-confirm="Delete {{ d.der_id }}?">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <button type="submit" class="btn btn-xs btn-outline-danger" title="Delete request">
+                    <i class="fas fa-trash"></i>
+                  </button>
+                </form>
+                {% endif %}
+              </span>
+            </div>
+          </td>
+        </tr>
+
+        {# ── Expandable preview row ── #}
+        <tr id="der-preview-{{ d.uuid }}" style="display:none;">
+          <td colspan="8" class="p-0">
+            <div style="background:var(--surface-muted);border-top:1px solid var(--border-light);padding:1rem 1.25rem;">
+
+              <div class="d-flex align-items-center gap-3 mb-3">
+                <span class="req-id-badge">{{ d.der_id }}</span>
+                <span class="tlp-badge tlp-{{ d.tlp | slug }}">TLP:{{ d.tlp | upper }}</span>
+                {% if d.audience %}<span class="text-muted small">{{ d.audience }}</span>{% endif %}
+                <div class="d-flex align-items-center gap-2 ms-auto">
+                {% if d.review_state in ('draft', 'pending-review') %}
+                {{ approval_form(url_for('detection_eng.approve', id=d.uuid), can_publish, (d.audience or '') | trim) }}
+                {% endif %}
+                <button type="button" class="btn btn-xs btn-outline-secondary"
+                        data-recipients-url="{{ url_for('detection_eng.recipients_fragment', id=d.uuid) }}"
+                        title="Preview recipients">
+                  <i class="fas fa-users me-1"></i>Recipients
+                </button>
+                </div>
+              </div>
+
+              <div class="row g-3">
+                <div class="col-lg-8">
+                  <div class="mb-3">
+                    <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Hypothesis</div>
+                    <div style="font-size:.88rem;">{{ (d.hypothesis or 'Not specified.') | md_inline }}</div>
+                  </div>
+                  <div class="mb-3">
+                    <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Log sources</div>
+                    {{ bullets(d.log_sources) }}
+                  </div>
+                  <div class="mb-3">
+                    <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Expected rule output</div>
+                    <div style="font-size:.88rem;">{{ (d.expected_output or 'Not specified.') | md_inline }}</div>
+                  </div>
+                </div>
+                <div class="col-lg-4">
+                  <div class="border rounded p-2 mb-2" style="font-size:.8rem;background:var(--card-bg);">
+                    <div class="fw-semibold small mb-2">Technique(s)</div>
+                    {% for t in d.technique %}<span class="badge bg-secondary me-1 mb-1" style="font-size:.68rem;">{{ t }}</span>{% else %}<span class="text-muted">-</span>{% endfor %}
+                  </div>
+                  {% if d.cve_ids %}
+                  <div class="border rounded p-2 mb-2" style="font-size:.8rem;background:var(--card-bg);">
+                    <div class="fw-semibold small mb-2">CVE(s)</div>
+                    {% for c in d.cve_ids %}<span class="badge bg-secondary me-1 mb-1" style="font-size:.68rem;">{{ c }}</span>{% endfor %}
+                  </div>
+                  {% endif %}
+                  {% if d.existing_coverage %}
+                  <div class="border rounded p-2" style="font-size:.8rem;background:var(--card-bg);">
+                    <div class="fw-semibold small mb-2">Existing coverage (Rulezet)</div>
+                    <div data-rulezet-rules>{{ bullets(d.existing_coverage) }}</div>
+                  </div>
+                  {% endif %}
+                </div>
+              </div>
+
+              {% if d.review_state in ('draft', 'pending-review') %}
+              {% set has_audience = (d.audience or '') | trim %}
+              <div class="border-top mt-3 pt-3">
+                <div class="fw-semibold small mb-2"><i class="fas fa-gavel me-1"></i>Approve this request</div>
+                <p class="small text-muted mb-2">Approval publishes this request and notifies eligible stakeholders. The status board refreshes after submission.</p>
+                {% if not can_publish %}
+                <p class="small text-muted mb-2">Only users with MISP publish rights can approve and publish.</p>
+                {% elif not has_audience %}
+                <p class="small text-warning mb-2">Select a target audience on the <a href="{{ url_for('detection_eng.wizard_edit', id=d.uuid) }}">edit form</a> before publishing.</p>
+                {% endif %}
+              </div>
+              {% endif %}
+
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      {% endif %}
+      {% endfor %}
+    </table>
+    </div>
+    {% elif filtered %}
+    <div class="p-4 text-muted">No detection engineering requests match these filters.</div>
+    {% else %}
+    <div class="p-4 text-muted">No detection engineering requests yet. <a href="{{ url_for('detection_eng.wizard_new') }}">Create one</a>.</div>
+    {% endif %}
+  </div>
+</div>
+{% include "_published_delete_note.html" %}
+{% include "_recipients_modal.html" %}
+
+{# ── Inline feedback modal ── #}
+<div class="modal fade" id="feedback-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title">
+          <i class="fas fa-comment-dots me-2"></i>Feedback - <span id="feedback-product-id"></span>
+        </h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form id="feedback-form" method="post" action="">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="modal-body">
+          <div class="mb-3">
+            <label class="form-label small">Your name <span class="text-muted">(optional)</span></label>
+            <input type="text" name="author" class="form-control form-control-sm" placeholder="Name">
+          </div>
+          <div class="mb-3">
+            <label class="form-label small">Rating</label>
+            <select name="rating" class="form-select form-select-sm">
+              <option value="">- select rating -</option>
+              <option value="Very useful">Very useful</option>
+              <option value="Useful">Useful</option>
+              <option value="Somewhat useful">Somewhat useful</option>
+              <option value="Not useful">Not useful</option>
+            </select>
+          </div>
+          <div class="mb-2">
+            <label class="form-label small">Comments or suggestions</label>
+            <textarea name="comment" class="form-control form-control-sm" rows="4"
+                      placeholder="Questions, scoping feedback…"></textarea>
+          </div>
+        </div>
+        <div class="modal-footer py-2">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-sm btn-primary"><i class="fas fa-paper-plane me-1"></i>Submit</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  function setPreview(row, open) {
+    row.style.display = open ? '' : 'none';
+    document.querySelectorAll('[data-target="' + row.id + '"]').forEach(function(btn) {
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (btn.classList.contains('preview-toggle-btn')) {
+        var icon = btn.querySelector('i');
+        if (icon) icon.className = open ? 'fas fa-fw fa-eye-slash' : 'fas fa-fw fa-eye';
+      }
+    });
+  }
+
+  document.querySelectorAll('.preview-toggle-btn').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var targetId = btn.getAttribute('data-target');
+      var row = document.getElementById(targetId);
+      if (!row) return;
+      setPreview(row, row.style.display === 'none');
+    });
+  });
+
+  document.querySelectorAll('.approval-open').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var row = document.getElementById(btn.dataset.target);
+      if (!row) return;
+      setPreview(row, true);
+      row.scrollIntoView({behavior: 'smooth', block: 'center'});
+    });
+  });
+
+  // Feedback modal wiring
+  var feedbackModal = document.getElementById('feedback-modal');
+  if (feedbackModal) {
+    feedbackModal.addEventListener('show.bs.modal', function(e) {
+      var trigger = e.relatedTarget;
+      if (!trigger) return;
+      document.getElementById('feedback-product-id').textContent = trigger.getAttribute('data-der-id') || '';
+      document.getElementById('feedback-form').action = trigger.dataset.action;
+    });
+    feedbackModal.addEventListener('hidden.bs.modal', function() {
+      feedbackModal.querySelector('form').reset();
+    });
+  }
+})();
+
+/* ── Kanban board drag-and-drop (optimistic move, rollback on error) ── */
+(function() {
+  var dragging = null;
+  var msgEl = document.getElementById('kanban-msg');
+
+  function showError(text) {
+    if (!msgEl) return;
+    msgEl.textContent = text;
+    msgEl.style.display = '';
+  }
+  function clearError() {
+    if (!msgEl) return;
+    msgEl.style.display = 'none';
+  }
+  function bumpCount(col, delta) {
+    var badge = col.querySelector('.kanban-col-header .badge');
+    if (!badge) return;
+    badge.textContent = String(Math.max(0, (parseInt(badge.textContent, 10) || 0) + delta));
+  }
+  function setBusy(card, busy) {
+    var spin = card.querySelector('.kanban-card-spin');
+    var icon = card.querySelector('.kanban-card-icon');
+    if (spin) spin.style.display = busy ? '' : 'none';
+    if (icon) icon.style.display = busy ? 'none' : '';
+    card.style.opacity = busy ? '0.6' : '';
+    card.style.pointerEvents = busy ? 'none' : '';
+  }
+
+  document.querySelectorAll('.kanban-card').forEach(function(card) {
+    if (card.getAttribute('draggable') !== 'true') return;
+    card.addEventListener('dragstart', function(e) {
+      dragging = card;
+      card.style.opacity = '0.5';
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    card.addEventListener('dragend', function() {
+      if (dragging) dragging.style.opacity = '';
+      dragging = null;
+    });
+  });
+
+  document.querySelectorAll('.kanban-col[data-status]').forEach(function(col) {
+    col.addEventListener('dragover', function(e) {
+      if (!dragging) return;
+      e.preventDefault();
+      col.querySelector('.kanban-cards').classList.add('kanban-dragover');
+    });
+    col.addEventListener('dragleave', function() {
+      col.querySelector('.kanban-cards').classList.remove('kanban-dragover');
+    });
+    col.addEventListener('drop', function(e) {
+      e.preventDefault();
+      col.querySelector('.kanban-cards').classList.remove('kanban-dragover');
+      if (!dragging) return;
+      clearError();
+
+      var card = dragging;
+      var newStatus = col.dataset.status;
+      var url = card.dataset.updateUrl;
+      var sourceCol = card.closest('.kanban-col');
+      var sourceCards = sourceCol ? sourceCol.querySelector('.kanban-cards') : null;
+      if (!url || !sourceCol || sourceCol === col) return;
+
+      // Optimistic move: place the card in its new column right away.
+      card.style.opacity = '';
+      col.querySelector('.kanban-cards').appendChild(card);
+      bumpCount(sourceCol, -1);
+      bumpCount(col, 1);
+      setBusy(card, true);
+
+      var fd = new FormData();
+      fd.append('status', newStatus);
+      var csrf = document.querySelector('meta[name="csrf-token"]');
+      var headers = {};
+      if (csrf) headers['X-CSRF-Token'] = csrf.content;
+
+      fetch(url, {method: 'POST', body: fd, headers: headers})
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.ok) {
+            var cell = document.querySelector('.der-status-cell[data-id="' + card.dataset.id + '"]');
+            if (cell) {
+              var badgeClasses = {
+                'Active': 'bg-success-subtle text-success-emphasis',
+                'In Dev': 'bg-primary-subtle text-primary-emphasis',
+                'In Test': 'bg-warning-subtle text-warning-emphasis',
+                'Retired': 'bg-light text-muted border',
+                'Pending': 'bg-secondary-subtle text-secondary-emphasis',
+              };
+              cell.className = 'badge der-status-cell ' + (badgeClasses[data.status] || 'bg-secondary-subtle text-secondary-emphasis');
+              cell.textContent = data.status;
+            }
+          } else {
+            // Roll back to the original column.
+            if (sourceCards) sourceCards.appendChild(card);
+            bumpCount(col, -1);
+            bumpCount(sourceCol, 1);
+            showError((data.error || 'Could not update status.'));
+          }
+        })
+        .catch(function() {
+          if (sourceCards) sourceCards.appendChild(card);
+          bumpCount(col, -1);
+          bumpCount(sourceCol, 1);
+          showError('Status update did not complete. Check your connection and try again.');
+        })
+        .finally(function() {
+          setBusy(card, false);
+        });
+    });
+  });
+})();
+</script>
+{% endblock %}

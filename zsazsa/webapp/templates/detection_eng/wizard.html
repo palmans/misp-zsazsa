@@ -1,0 +1,293 @@
+{% extends "base.html" %}
+{% from "_product_actions.html" import draft_actions %}
+{% from "_macros.html" import galaxy_multiselect, review_state_badge %}
+
+{% set title_text = ('Edit ' + der.der_id) if is_edit else 'New detection engineering request' %}
+{% block title %}{{ title_text }} | zsazsa CTI{% endblock %}
+{% block page_title %}{{ title_text }}{% endblock %}
+{% block topbar_actions %}
+<a href="{{ url_for('detection_eng.review') }}" class="btn btn-sm btn-light border shadow-sm">
+  <i class="fas fa-arrow-left me-1"></i> Back to list
+</a>
+{% endblock %}
+
+{% macro lines(items) %}{{ (items or []) | join('\n') }}{% endmacro %}
+
+{% block head_extra %}{% include "_rulezet_assets.html" %}{% endblock %}
+
+{% block content %}
+{% set steps = [('request', 'Request'), ('techniques', 'Techniques and CVEs'), ('hypothesis', 'Hypothesis'), ('sources', 'Source events')] %}
+<section class="record-hero record-hero-compact rise mb-3">
+  <span class="hero-icon" aria-hidden="true"><i class="fas fa-crosshairs"></i></span>
+  <div class="hero-main">
+    <p class="lead-text">A detection engineering request asks for a rule: what to catch, from which logs, and how to know it works. Pick the techniques first; Rulezet then shows what already exists.</p>
+    <nav class="form-steps" aria-label="Sections of the form">
+      {% for key, label in steps %}<a href="#step-{{ key }}">{{ loop.index }} {{ label }}</a>{% endfor %}
+    </nav>
+  </div>
+</section>
+
+<form method="post" class="row g-4" id="der-form" data-unsaved-warning>
+
+  <div class="col-lg-8">
+
+    {% if source_events %}
+    <div class="card content-card mb-4">
+      <div class="card-header"><i class="fas fa-database me-2"></i>Source events ({{ source_events | length }})</div>
+      <div class="card-body">
+        {% for ev in source_events %}
+        <div class="small mb-2">
+          <span class="font-monospace text-muted me-2" style="font-size:.72rem;">{{ ev.uuid[:8] }}…</span>
+          {{ ev.info or '(untitled)' }}
+          {% if ev.date %}<span class="mini-chip ms-2 fw-normal">{{ ev.date }}</span>{% endif %}
+          {% if ev.orgc %}<span class="mini-chip ms-1 fw-normal">{{ ev.orgc }}</span>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="card content-card form-step mb-4" id="step-request" data-step='input[name="title"]'>
+      <div class="card-header d-flex align-items-center"><span class="step-num">1</span>Request</div>
+      <div class="card-body">
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label required-label">Title</label>
+            <input name="title" class="form-control" required
+                   placeholder="Detect lateral movement via WMI (T1047)"
+                   value="{{ der.title if der else '' }}">
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Format</label>
+            {# On edit the format belongs to the draft rule, which is changed on the
+               request page; wizard_edit ignores whatever is posted here. #}
+            <select name="format" id="der-format" class="form-select"
+                    {% if is_edit %}disabled title="Change the format with the draft rule on the request page."{% endif %}>
+              <option value="">-</option>
+              {% for f in formats %}
+              <option value="{{ f }}" {{ 'selected' if der and der.format == f }}>{{ f | upper }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Priority</label>
+            <select name="priority" class="form-select">
+              <option value="">-</option>
+              {% for p in priorities %}
+              <option value="{{ p }}" {{ 'selected' if der and der.priority == p }}>{{ p }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Status</label>
+            <input type="text" class="form-control" value="{{ der.status if der else statuses[0] }}" disabled>
+            <div class="form-text">Engineering team's own progress tracker. Change it from the status board.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card content-card form-step mb-4" id="step-techniques" data-step='[name="technique"], input[name="cve_ids"]'>
+      <div class="card-header d-flex align-items-center"><span class="step-num">2</span>MITRE ATT&amp;CK techniques and CVEs</div>
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center" style="min-height:2.1rem;">
+          <label class="form-label mb-0">Technique(s) this request targets</label>
+          <span id="btn-rulezet-der-lookup-wrap"
+                {% if rulezet_enabled %}title="Select at least one MITRE ATT&amp;CK technique above first."{% else %}data-rulezet-unconfigured title="Rulezet is off: switch it on, with its address, under Settings > Connections."{% endif %}>
+            <button type="button" class="btn btn-sm btn-outline-primary" id="btn-rulezet-der-lookup" disabled>
+              <img src="{{ url_for('static', filename='rulezet-icon.png') }}"
+                   alt="" style="height:22px;vertical-align:middle;margin-right:6px;">
+              Search Rulezet
+            </button>
+          </span>
+        </div>
+        <div class="mt-1">
+          {{ galaxy_multiselect("technique", values=(der.technique if der else []), items=galaxy_mitre_attack, dom_id="der-technique") }}
+        </div>
+        <div class="d-flex justify-content-between align-items-center mt-3" style="min-height:2.1rem;">
+          <label class="form-label mb-0" for="der-cve-ids">CVE(s) this request targets</label>
+          <span id="btn-rulezet-der-cve-lookup-wrap"
+                {% if rulezet_enabled %}title="Enter a CVE ID first."{% else %}data-rulezet-unconfigured title="Rulezet is off: switch it on, with its address, under Settings > Connections."{% endif %}>
+            <button type="button" class="btn btn-sm btn-outline-primary" id="btn-rulezet-der-cve-lookup" disabled>
+              <img src="{{ url_for('static', filename='rulezet-icon.png') }}"
+                   alt="" style="height:22px;vertical-align:middle;margin-right:6px;">
+              Search Rulezet
+            </button>
+          </span>
+        </div>
+        <input type="text" name="cve_ids" id="der-cve-ids" class="form-control mt-1"
+               value="{{ der.cve_ids | join(', ') if der else '' }}"
+               placeholder="Optional, e.g. CVE-2024-3400, CVE-2023-4966">
+        <div class="form-text mt-2">Search Rulezet first: if a rule is a close match, worth adapting, or should be used as a base, add it below.</div>
+        <div class="mt-2">
+          <label class="form-label small mb-1">Existing coverage (Rulezet)</label>
+          <textarea name="existing_coverage" id="der-existing-coverage" class="form-control" rows="3"
+                    placeholder="Rules already found on Rulezet for these techniques or CVEs">{{ lines(der.existing_coverage) if der else '' }}</textarea>
+          <div id="rulezet-der-status" class="small text-danger fw-semibold mt-1" style="display:none;"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card content-card form-step mb-4" id="step-hypothesis"
+         data-step='textarea[name="hypothesis"], textarea[name="log_sources"], textarea[name="expected_output"], textarea[name="test_cases"]'>
+      <div class="card-header d-flex align-items-center"><span class="step-num">3</span>Detection hypothesis</div>
+      <div class="card-body">
+        <div class="mb-3">
+          <label class="form-label">Trigger / hypothesis</label>
+          <textarea name="hypothesis" class="form-control" rows="3"
+                    placeholder="What behaviour, in what conditions, should fire this detection?">{{ der.hypothesis if der else '' }}</textarea>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Log sources</label>
+          <textarea name="log_sources" class="form-control" rows="3"
+                    placeholder="One log source per line, e.g. Sysmon EID 1, EDR process telemetry">{{ lines(der.log_sources) if der else '' }}</textarea>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Expected rule output</label>
+          <textarea name="expected_output" class="form-control" rows="3"
+                    placeholder="What should the rule alert on, and with what fidelity?">{{ der.expected_output if der else '' }}</textarea>
+        </div>
+        <div>
+          <label class="form-label">Test cases</label>
+          <textarea name="test_cases" class="form-control" rows="3"
+                    placeholder="One test case per line: how to validate the rule fires (and does not over-fire)">{{ lines(der.test_cases) if der else '' }}</textarea>
+        </div>
+      </div>
+    </div>
+
+    <div class="card content-card form-step mb-4" id="step-sources" data-step='input[name="source_event_url_item"]'>
+      <div class="card-header d-flex align-items-center"><span class="step-num">4</span>Source MISP events</div>
+      <div class="card-body">
+        {% set existing_source_uuids = (der.source_event_uuids if der and der.source_event_uuids else ([der.source_event_uuid] if der and der.source_event_uuid else [])) %}
+        <label class="form-label">Triggering events (optional)</label>
+        {% for u in existing_source_uuids + [''] %}
+        {% set meta = (source_events | selectattr('uuid', 'equalto', u) | list | first) if u else None %}
+        {% set event_base = ((meta.source_url if meta and meta.source_url else misp_webapp_url) or '') %}
+        <input type="text" name="source_event_url_item" class="form-control form-control-sm font-monospace mb-2"
+               placeholder="https://misp.example/events/view/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+               value="{{ (event_base.rstrip('/') ~ '/events/view/' ~ u) if u else '' }}">
+        {% endfor %}
+        <div class="form-text">The events that motivated this request, if any. Paste another into the empty field, or clear one to remove it.</div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="col-lg-4">
+    {# In the column rather than in its stack of cards, so it stays in view to the
+       end of the form as the stack scrolls away under it. #}
+    <div class="card content-card form-save mb-4">
+      <div class="card-header">As it will appear</div>
+      <div class="card-body d-flex flex-column gap-3">
+        <div class="form-preview">
+          <span class="monogram" aria-hidden="true"><i class="fas fa-crosshairs"></i></span>
+          <div class="min-w-0">
+            <span class="req-id-badge">{{ der.der_id if is_edit and der else 'New request' }}</span>
+            <div class="form-preview-title" data-preview-text="title" data-empty="No title yet"></div>
+          </div>
+        </div>
+        <dl class="form-facts">
+          <dt>Priority</dt><dd data-preview-select="priority" data-empty="Not set"></dd>
+          <dt>TLP</dt><dd data-preview-choice="tlp"></dd>
+          <dt>Audience</dt><dd data-preview-choice="audience" data-required data-empty="None yet, one is needed to save"></dd>
+          <dt>State</dt><dd>{{ review_state_badge(der.review_state if is_edit and der else 'draft') }}</dd>
+          {% if source_events %}<dt>Sources</dt><dd>{{ source_events | length }} source event{{ 's' if source_events | length != 1 }}</dd>{% endif %}
+        </dl>
+        {{ draft_actions(url_for('detection_eng.review'), 'btn-der-save', 'btn-der-submit') }}
+      </div>
+    </div>
+
+    <div class="d-flex flex-column gap-4">
+    <div class="card content-card">
+      <div class="card-header"><i class="fas fa-sliders me-2"></i>Classification</div>
+      <div class="card-body">
+        <div class="mb-3">
+          <span class="form-label d-block required-label">Audience</span>
+          {% set current_audiences = (der.audience or '').split(', ') if der else [] %}
+          <div class="choice-group" aria-label="Audience">
+            {% for a in audiences %}
+            <input class="btn-check der-audience-cb" type="checkbox" name="audience" value="{{ a }}" id="der-aud-{{ loop.index }}"
+                   {{ 'checked' if a in current_audiences }}>
+            <label class="choice" for="der-aud-{{ loop.index }}">{{ a }}</label>
+            {% endfor %}
+          </div>
+          <div id="der-audience-warn" class="text-danger small mt-1" style="display:none;">
+            <i class="fas fa-triangle-exclamation me-1"></i>Select at least one audience.
+          </div>
+          <div class="form-text">Corresponds to the stakeholder <strong>role</strong>. Select at least one audience, which is required before this can be approved and published.</div>
+        </div>
+        <div class="mb-3">
+          <span class="form-label d-block">TLP</span>
+          {% set current_tlp = der.tlp if der and der.tlp in tlp_levels else 'amber' %}
+          <div class="choice-group" role="radiogroup" aria-label="TLP">
+            {% for t in tlp_levels %}
+            <input class="btn-check" type="radio" name="tlp" value="{{ t }}" id="der-tlp-{{ loop.index }}"
+                   {{ 'checked' if t == current_tlp }}>
+            <label class="choice" for="der-tlp-{{ loop.index }}"><span class="tlp-badge tlp-{{ t | slug }}">TLP:{{ t | upper }}</span></label>
+            {% endfor %}
+          </div>
+        </div>
+        <div>
+          <label class="form-label" for="der-linked-pir">Linked PIR</label>
+          <select name="linked_pir_uuid" id="der-linked-pir" class="form-select">
+            <option value="">(none)</option>
+            {% for p in pirs %}
+            <option value="{{ p.uuid }}" {{ 'selected' if der and der.linked_pir_uuid == p.uuid }}>{{ p.pir_id }}: {{ p.question | truncate(50) }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div class="card content-card">
+      <div class="card-header"><i class="fas fa-user me-2"></i>Attribution</div>
+      <div class="card-body">
+        <label class="form-label" for="der-author">Author</label>
+        <input name="author" id="der-author" class="form-control" value="{{ der.author if der else '' }}">
+      </div>
+    </div>
+    </div>
+
+  </div>
+</form>
+{% endblock %}
+
+{% block scripts %}
+{% include "_form_steps_js.html" %}
+{% include "requirements/_form_preview_js.html" %}
+<script>
+/* ── Detection lookup (Rulezet, by MITRE ATT&CK technique and by CVE) ── */
+zsazsaBindRulezetAttackLookup({
+  buttonId: 'btn-rulezet-der-lookup',
+  statusId: 'rulezet-der-status',
+  targetId: 'der-existing-coverage',
+  checkboxName: 'technique',
+  readyTitle: 'Search Rulezet for public rules matching the technique(s) selected above',
+});
+zsazsaBindRulezetCveLookup({
+  buttonId: 'btn-rulezet-der-cve-lookup',
+  statusId: 'rulezet-der-status',
+  targetId: 'der-existing-coverage',
+  inputId: 'der-cve-ids',
+  readyTitle: 'Search Rulezet for public rules matching the CVE ID(s) entered',
+});
+
+/* ── Audience validation ── */
+(function() {
+  function _updateDerAudienceBtns() {
+    var checked = document.querySelectorAll('.der-audience-cb:checked').length > 0;
+    ['btn-der-submit', 'btn-der-save'].forEach(function(id) {
+      var b = document.getElementById(id);
+      if (b) b.disabled = !checked;
+    });
+    var warn = document.getElementById('der-audience-warn');
+    if (warn) warn.style.display = checked ? 'none' : '';
+  }
+  document.querySelectorAll('.der-audience-cb').forEach(function(cb) {
+    cb.addEventListener('change', _updateDerAudienceBtns);
+  });
+  _updateDerAudienceBtns();
+})();
+
+</script>
+{% endblock %}

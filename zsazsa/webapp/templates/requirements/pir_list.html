@@ -1,0 +1,265 @@
+{% extends "base.html" %}
+{% from "_sort.html" import sort_th %}
+{% from "_macros.html" import status_menu %}
+
+{% block title %}PIRs | zsazsa CTI{% endblock %}
+{% block page_title %}Priority Intelligence Requirements{% endblock %}
+
+{% block content %}
+{% import "_charts.html" as charts with context %}
+{# The groups the rows are shown in, in this order; a rejected PIR has its own. #}
+{% set lanes = ['Active', 'Pending', 'In Development', 'Under Evaluation', 'Implemented', 'Retired'] %}
+{% for pir in pirs if pir.intake_status != 'rejected' and pir.status not in lanes %}{% set _ = lanes.append(pir.status) %}{% endfor %}
+{% set _ = lanes.append('Rejected') %}
+{% set lane_hints = {'Active': 'Judged by the analyser on every run', 'Pending': 'Triage before they become active',
+                     'Retired': 'Kept for their history', 'Rejected': 'Rejected in triage'} %}
+{% set pir_statuses = ['Pending', 'Active', 'In Development', 'Under Evaluation', 'Implemented', 'Retired'] %}
+{% set moves = pir_statuses[1:] %}
+{# The triage button names where an untriaged PIR stands: label, icon, style. #}
+{% set triage_buttons = {
+  'acknowledged': ('Acknowledged', 'fa-eye', 'btn-outline-primary'),
+  'deferred': ('Deferred', 'fa-pause-circle', 'btn-outline-secondary'),
+} %}
+{% set triage_default = ('Triage', 'fa-gavel', 'btn-outline-warning') %}
+{% set kpi = namespace(active=0, triage=0, late=0) %}
+{% for pir in pirs if pir.intake_status != 'rejected' %}
+  {% if pir.status == 'Active' %}{% set kpi.active = kpi.active + 1 %}
+    {% if pir.next_review and pir.next_review < today %}{% set kpi.late = kpi.late + 1 %}{% endif %}
+  {% elif pir.status == 'Pending' %}{% set kpi.triage = kpi.triage + 1 %}{% endif %}
+{% endfor %}
+
+<section class="record-hero record-hero-compact rise mb-3">
+  <div class="hero-main">
+    <span class="hero-icon" aria-hidden="true"><i class="fas fa-star"></i></span>
+    <div class="record-kpis">
+      <div class="record-kpi"><b>{{ pirs | length }}</b><span>PIR{{ 's' if pirs | length != 1 }}{{ ', ' ~ rejected_count ~ ' rejected not shown' if rejected_count and not show_rejected }}</span></div>
+      <div class="record-kpi"><b>{{ kpi.active }}</b><span>active</span></div>
+      <div class="record-kpi"><b>{{ kpi.triage }}</b><span>waiting for triage</span></div>
+      <div class="record-kpi{{ ' warn' if kpi.late }}"><b>{{ kpi.late }}</b><span>active PIR{{ 's' if kpi.late != 1 }} past the review</span></div>
+    </div>
+    <div class="hero-actions">
+      <a href="{{ url_for('requirements.pir_new') }}" class="btn btn-sm btn-hero"><i class="fas fa-plus me-1"></i> New PIR</a>
+      <a href="{{ url_for('export.pirs') }}" class="btn btn-sm btn-hero-ghost" title="Export as Markdown"><i class="fas fa-download me-1"></i> Export</a>
+    </div>
+  </div>
+  {% if priority_counts or level_counts %}
+  <div class="record-panel list-stats">
+    <div>{{ charts.mix('Status', status_counts, charts.status_colors) }}</div>
+    <div>{{ charts.mix('Priority', priority_counts, charts.priority_colors, param='priority', selected=priority_filter) }}</div>
+    <div>{{ charts.mix('Intelligence level', level_counts, charts.intel_colors, param='intel_level', selected=intel_filter) }}</div>
+  </div>
+  {% endif %}
+</section>
+
+<form method="get" class="card content-card list-filters record-filters rise rise-1 mb-4">
+  {% if show_rejected %}<input type="hidden" name="rejected" value="1">{% endif %}
+  {{ charts.filter_select('intel_level', 'Intelligence level', 'fa-layer-group', 'All levels', intel_levels, intel_filter) }}
+  {{ charts.filter_select('priority', 'Priority', 'fa-flag', 'All priorities', priorities, priority_filter) }}
+  {% if rejected_count %}
+  <a href="{{ url_for('requirements.pir_list', **dict(request.args.to_dict(), rejected=None if show_rejected else 1)) }}"
+     class="btn btn-sm btn-outline-secondary">
+    <i class="fas {{ 'fa-eye-slash' if show_rejected else 'fa-box-archive' }} me-1"></i>
+    {{ 'Hide rejected PIRs' if show_rejected else 'Show rejected PIRs (' ~ rejected_count ~ ')' }}
+  </a>
+  {% endif %}
+  <div class="shown">
+    <span>{{ pirs | length }} PIR{{ 's' if pirs|length != 1 }}</span>
+    {% if intel_filter or priority_filter %}
+    <a href="{{ url_for('requirements.pir_list') }}" class="btn btn-xs btn-outline-secondary">Clear</a>
+    {% endif %}
+  </div>
+</form>
+
+<div class="card content-card rise rise-2">
+  <div class="card-body p-0">
+    {% if pirs %}
+    <div class="table-responsive">
+    <table class="table table-hover zsazsa-table req-table mb-0">
+      <thead>
+        <tr>
+          {{ sort_th('ID', 'id', width='90px') }}
+          {{ sort_th('Question', 'text') }}
+          <th>Owner</th>
+          <th>Level</th>
+          <th>Priority</th>
+          {{ sort_th('Status', 'status') }}
+          <th title="Scope items">Scope</th>
+          {{ sort_th('Next review', 'next_review') }}
+          <th class="text-end">Actions</th>
+        </tr>
+      </thead>
+      {% for lane in lanes %}
+      {% set rows = pirs | selectattr('intake_status', 'equalto', 'rejected') | list if lane == 'Rejected'
+                    else pirs | selectattr('status', 'equalto', lane) | rejectattr('intake_status', 'equalto', 'rejected') | list %}
+      {% if rows %}
+      <tbody>
+        <tr class="lane-head">
+          <th colspan="9">
+            <span class="lane-mark" style="background:{{ charts.status_colors.get(lane, 'var(--neutral-400)') }};"></span>
+            <span class="lane-name">{{ lane }}</span>
+            <span class="lane-count">{{ rows | length }} PIR{{ 's' if rows | length != 1 }}</span>
+            {% if lane_hints.get(lane) %}<span class="lane-hint">{{ lane_hints[lane] }}</span>{% endif %}
+          </th>
+        </tr>
+        {% for pir in rows %}
+        {% set untriaged = pir.status == 'Pending' and pir.intake_status != 'rejected' %}
+        <tr class="req-row {{ 'triage-pending-row' if untriaged }}" data-req-id="{{ pir.id }}">
+          <td>
+            <a href="{{ url_for('requirements.pir_detail', id=pir.id) }}" class="text-decoration-none">
+              <span class="req-id-badge">{{ pir.pir_id }}</span>
+            </a>
+          </td>
+          <td>
+            <a href="{{ url_for('requirements.pir_detail', id=pir.id) }}" class="fw-semibold text-decoration-none">
+              {{ pir.question | truncate(90) }}
+            </a>
+            {% if pir.context %}<div class="text-muted small" title="{{ pir.context }}">{{ pir.context | truncate(110) }}</div>{% endif %}
+            {% if linked_girs.get(pir.uuid) %}
+            <div class="req-links text-muted small mt-1">
+              Related GIRs:
+              {% for g in linked_girs[pir.uuid] %}
+              <a href="{{ url_for('requirements.gir_detail', id=g.id) }}" class="text-decoration-none ms-1" title="{{ g.topic }}">
+                <span class="req-id-badge">{{ g.gir_id }}</span> {{ g.topic | truncate(40) }}</a>{{ ',' if not loop.last }}
+              {% endfor %}
+            </div>
+            {% endif %}
+          </td>
+          <td>
+            {% if pir.owner_stakeholder %}
+            <a href="{{ url_for('stakeholders.detail', id=pir.owner_stakeholder.id) }}" class="owner-cell text-decoration-none text-body">
+              <span class="monogram" aria-hidden="true">{{ pir.owner_stakeholder.name[:1] | upper }}</span>{{ pir.owner_stakeholder.name }}
+            </a>
+            {% elif pir.owner_name %}
+            <span class="owner-cell"><span class="monogram" aria-hidden="true">{{ pir.owner_name[:1] | upper }}</span>{{ pir.owner_name }}</span>
+            {% else %}
+            <span class="owner-cell none"><span class="monogram" aria-hidden="true">?</span>No owner yet</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if pir.intel_level %}
+            <div class="d-flex flex-wrap gap-1">
+              {% for lvl in pir.intel_level %}
+              <span class="badge level-badge level-{{ lvl | slug }}">{{ lvl }}</span>
+              {% endfor %}
+            </div>
+            {% else %}
+            <span class="text-muted small">-</span>
+            {% endif %}
+          </td>
+          <td>
+            {% set rank = {'Must have': 3, 'Should have': 2, 'Could have': 1}.get(pir.priority, 0) %}
+            <div class="prio-steps" aria-hidden="true"><i class="{{ 'on' if rank >= 1 }}"></i><i class="{{ 'on' if rank >= 2 }}"></i><i class="{{ 'on' if rank >= 3 }}"></i></div>
+            <span class="badge priority-badge priority-{{ pir.priority | slug }}">{{ pir.priority }}</span>
+          </td>
+          <td style="min-width:10rem;">
+            {% set at = pir_statuses.index(pir.status) if pir.status in pir_statuses and pir.intake_status != 'rejected' else -1 %}
+            <div class="status-steps" aria-hidden="true">
+              {% for s in pir_statuses %}<i class="{{ 'now' if loop.index0 == at else ('done' if loop.index0 < at) }}"></i>{% endfor %}
+            </div>
+            {% if pir.intake_status == 'rejected' %}
+            <span class="badge status-badge status-rejected">Rejected</span>
+            {% else %}
+            <span class="badge status-badge status-{{ pir.status | slug }}">{{ pir.status }}</span>
+            {% endif %}
+            {% if pir.intake_status == 'submitted' %}
+            <i class="fas fa-inbox fa-xs ms-1" style="color:var(--accent-orange);" title="Triage: submitted"></i>
+            {% elif pir.intake_status == 'acknowledged' %}
+            <i class="fas fa-eye fa-xs ms-1" style="color:var(--accent-blue);" title="Triage: acknowledged"></i>
+            {% elif pir.intake_status == 'triaged' %}
+            <i class="fas fa-clipboard-check fa-xs ms-1" style="color:var(--accent-cyan);" title="Triage: triaged"></i>
+            {% elif pir.intake_status == 'approved' %}
+            <i class="fas fa-check-circle fa-xs ms-1" style="color:var(--status-active-fg);" title="Triage: approved"></i>
+            {% elif pir.intake_status == 'rejected' %}
+            <i class="fas fa-ban fa-xs ms-1" style="color:var(--status-rejected-fg);" title="Triage: rejected"></i>
+            {% elif pir.intake_status == 'deferred' %}
+            <i class="fas fa-pause-circle fa-xs ms-1" style="color:var(--neutral-600);" title="Triage: deferred"></i>
+            {% elif pir.intake_status == 'merged' %}
+            <i class="fas fa-code-branch fa-xs ms-1" style="color:var(--neutral-600);" title="Triage: merged"></i>
+            {% endif %}
+            {% if untriaged %}
+            {% set label, icon, style = triage_buttons.get(pir.intake_status, triage_default) %}
+            <div class="mt-1">
+              <button type="button" class="btn btn-xs {{ style }} text-nowrap triage-toggle"
+                      data-target="triage-row-{{ pir.id }}" aria-expanded="false" title="Triage this PIR">
+                <i class="fas {{ icon }} me-1"></i>{{ label }}
+              </button>
+            </div>
+            {% endif %}
+          </td>
+          <td>
+            {% set n = scope_counts.get(pir.id, 0) %}
+            <span class="scope-ring" style="--p:{{ [n * 5, 100] | min }}%;" title="{{ n }} scope item{{ 's' if n != 1 }}">{{ n }}</span>
+          </td>
+          <td class="small">
+            {% if pir.next_review %}
+            <span class="text-muted">{{ pir.next_review.strftime('%d-%m-%Y') }}</span>
+            {% if pir.next_review < today and pir.status not in ('Retired', 'Implemented') and pir.intake_status != 'rejected' %}
+            <span class="overdue">{{ (today - pir.next_review).days }} day{{ 's' if (today - pir.next_review).days != 1 }} overdue</span>
+            {% endif %}
+            {% else %}
+            <span class="text-muted">-</span>
+            {% endif %}
+          </td>
+          <td class="text-end">
+            <div class="d-inline-flex flex-nowrap gap-1 justify-content-end">
+              <button type="button" class="btn btn-xs btn-outline-info scope-preview-toggle"
+                      title="Preview matches in collection"
+                      aria-expanded="false"
+                      data-target="scope-row-{{ pir.id }}"
+                      data-fragment-url="{{ url_for('requirements.pir_scope_preview', id=pir.id, fragment=1) }}">
+                <i class="fas fa-eye"></i>
+              </button>
+              {% if not untriaged and pir.intake_status != 'rejected' %}
+              {{ status_menu(pir.pir_id, pir.status, moves, url_for('requirements.pir_status_update', id=pir.id)) }}
+              {% endif %}
+              {% if pir.intake_status != 'rejected' %}
+              <a href="{{ url_for('requirements.pir_edit', id=pir.id) }}" class="btn btn-xs btn-outline-secondary" title="Edit">
+                <i class="fas fa-pen"></i>
+              </a>
+              {% endif %}
+              <form method="post" action="{{ url_for('requirements.pir_delete', id=pir.id) }}" class="d-inline" data-submit-confirm="Delete {{ pir.pir_id }}?">
+                <button class="btn btn-xs btn-outline-danger" title="Delete">
+                  <i class="fas fa-trash"></i>
+                </button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        <tr id="scope-row-{{ pir.id }}" class="scope-preview-row d-none">
+          <td colspan="9" class="bg-body-secondary p-3">
+            <div class="scope-preview-body">
+              <div class="text-muted small"><i class="fas fa-spinner fa-spin me-1"></i>Loading matches&hellip;</div>
+            </div>
+          </td>
+        </tr>
+        {% if untriaged %}
+        <tr id="triage-row-{{ pir.id }}" class="triage-row d-none">
+          <td colspan="9" class="bg-body-secondary p-3">
+            {% include "requirements/_pir_triage_form.html" %}
+          </td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+      </tbody>
+      {% endif %}
+      {% endfor %}
+    </table>
+    </div>
+    {% else %}
+    <div class="empty-state py-5">
+      <i class="fas fa-star fa-2x text-muted mb-3 d-block"></i>
+      <p class="text-muted mb-3">{{ 'No PIR matches these filters.' if intel_filter or priority_filter else 'No PIRs yet. Add your first priority intelligence requirement.' }}</p>
+      <a href="{{ url_for('requirements.pir_new') }}" class="btn btn-primary btn-sm">
+        <i class="fas fa-plus me-1"></i> New PIR
+      </a>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% include "requirements/_triage_js.html" %}
+{% include "requirements/_list_scope_js.html" %}
+{% include "_status_move_js.html" %}
+{% endblock %}

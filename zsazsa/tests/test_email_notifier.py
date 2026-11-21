@@ -1,0 +1,340 @@
+"""Tests for the email notifier.
+
+Verifies recipient resolution from email channels and that send_email builds a
+multipart message and delivers it over a (mocked) SMTP connection.
+
+    python -m unittest tests.test_email_notifier
+"""
+
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import config
+from notifier import email, product_email
+from webapp import branding
+
+
+class Recipients(unittest.TestCase):
+    def setUp(self):
+        self._orig = config.NOTIFICATION_CHANNELS
+        config.NOTIFICATION_CHANNELS = [
+            {"id": "mm1", "name": "MM", "type": "mattermost", "url": "x", "enabled": True},
+            {"id": "em1", "name": "SOC", "type": "email", "recipient": "soc@x.test", "enabled": True},
+            {"id": "em2", "name": "Off", "type": "email", "recipient": "off@x.test", "enabled": False},
+            {"id": "em3", "name": "Dup", "type": "email", "recipient": "soc@x.test", "enabled": True},
+        ]
+
+    def tearDown(self):
+        config.NOTIFICATION_CHANNELS = self._orig
+
+    def test_only_enabled_email_channels(self):
+        self.assertEqual(email._recipients(), ["soc@x.test"])
+
+    def test_filter_by_channel_ids(self):
+        self.assertEqual(email._recipients(["em1"]), ["soc@x.test"])
+        self.assertEqual(email._recipients(["mm1"]), [])
+
+    def test_ignores_mattermost_and_disabled(self):
+        self.assertEqual(email._recipients(["em2"]), [])
+
+
+class SendEmail(unittest.TestCase):
+    def setUp(self):
+        self._orig_attrs = {
+            k: getattr(config, k, None)
+            for k in ("SMTP_HOST", "SMTP_PORT", "SMTP_USE_TLS", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM")
+        }
+        config.SMTP_HOST = "smtp.test"
+        config.SMTP_PORT = 587
+        config.SMTP_USE_TLS = True
+        config.SMTP_USERNAME = "user"
+        config.SMTP_PASSWORD = "pw"
+        config.SMTP_FROM = "cti@x.test"
+
+    def tearDown(self):
+        for k, v in self._orig_attrs.items():
+            setattr(config, k, v)
+
+    def test_no_recipients_returns_false(self):
+        with mock.patch("notifier.email.smtplib.SMTP") as smtp:
+            self.assertFalse(email.send_email([], "s", "body", "label"))
+            smtp.assert_not_called()
+
+    def test_missing_host_returns_false(self):
+        config.SMTP_HOST = ""
+        with mock.patch("notifier.email.smtplib.SMTP") as smtp:
+            self.assertFalse(email.send_email(["a@x.test"], "s", "body", "label"))
+            smtp.assert_not_called()
+
+    def test_sends_multipart_with_starttls_and_login(self):
+        with mock.patch("notifier.email.smtplib.SMTP") as smtp:
+            server = smtp.return_value.__enter__.return_value
+            ok = email.send_email(["a@x.test"], "Subject", "# Hello", "label")
+
+        self.assertTrue(ok)
+        server.starttls.assert_called_once()
+        server.login.assert_called_once_with("user", "pw")
+        msg = server.send_message.call_args.args[0]
+        self.assertEqual(msg["Subject"], "Subject")
+        self.assertEqual(msg["From"], "cti@x.test")
+        self.assertEqual(msg["To"], "a@x.test")
+        self.assertTrue(msg.is_multipart())
+        # The HTML alternative carries the branded header, whose logo travels as
+        # a related Content-ID part, so it is wrapped in a multipart/related.
+        types = {p.get_content_type() for p in msg.walk()}
+        self.assertIn("text/plain", types)
+        self.assertIn("text/html", types)
+
+    def test_sender_name_is_used_when_configured(self):
+        with mock.patch.object(config, "SMTP_SENDER_NAME", "Threat Intelligence", create=True), \
+             mock.patch("notifier.email.smtplib.SMTP") as smtp:
+            server = smtp.return_value.__enter__.return_value
+            email.send_email(["a@x.test"], "Subject", "body", "label")
+
+        msg = server.send_message.call_args.args[0]
+        self.assertEqual(msg["From"], "Threat Intelligence <cti@x.test>")
+
+    def test_missing_sender_name_uses_only_sender_address(self):
+        with mock.patch.dict(config.__dict__):
+            config.__dict__.pop("SMTP_SENDER_NAME", None)
+            with mock.patch("notifier.email.smtplib.SMTP") as smtp:
+                server = smtp.return_value.__enter__.return_value
+                email.send_email(["a@x.test"], "Subject", "body", "label")
+
+        msg = server.send_message.call_args.args[0]
+        self.assertEqual(msg["From"], "cti@x.test")
+
+    def test_brand_logo_travels_as_a_related_part(self):
+        """The header only references the logo when one is configured, so the
+        brand has to be stubbed as well as the bytes: reading it from whatever
+        the developer happens to have set is what made this pass locally and
+        fail everywhere else."""
+        brand = dict(branding.brand(), logo_uri="data:image/png;base64,x")
+        with mock.patch("notifier.email.smtplib.SMTP") as smtp, \
+             mock.patch.object(branding, "brand", return_value=brand), \
+             mock.patch.object(branding, "logo_bytes", return_value=(b"png", "image", "png")):
+            server = smtp.return_value.__enter__.return_value
+            email.send_email(["a@x.test"], "Subject", "# Hello", "label")
+
+        msg = server.send_message.call_args.args[0]
+        logo = [p for p in msg.walk() if p.get("Content-ID") == "<brandlogo>"]
+        self.assertEqual(len(logo), 1)
+        self.assertEqual(logo[0].get_content_type(), "image/png")
+
+    def test_subject_carries_the_classification(self):
+        self.assertEqual(email._subject("clear", "Daily briefing 2026-07-30"),
+                         "[CTI] TLP:CLEAR - Daily briefing 2026-07-30")
+        # Requirements have no TLP and keep a plain subject.
+        self.assertEqual(email._subject("", "PIR-1: question"), "[CTI] PIR-1: question")
+
+    def test_multiple_recipients_are_hidden_from_each_other(self):
+        recipients = ["a@x.test", "b@x.test"]
+        with mock.patch("notifier.email.smtplib.SMTP") as smtp:
+            server = smtp.return_value.__enter__.return_value
+            email.send_email(recipients, "Subject", "body", "label")
+        msg = server.send_message.call_args.args[0]
+        # Addresses are not exposed in the visible To header...
+        self.assertEqual(msg["To"], "cti@x.test")
+        # ...but delivery still goes to every recipient.
+        self.assertEqual(server.send_message.call_args.kwargs["to_addrs"], recipients)
+
+    def test_smtp_error_returns_false(self):
+        import smtplib
+
+        with mock.patch("notifier.email.smtplib.SMTP", side_effect=smtplib.SMTPException("boom")):
+            self.assertFalse(email.send_email(["a@x.test"], "s", "body", "label"))
+
+
+class TestConnection(unittest.TestCase):
+    def test_missing_host(self):
+        self.assertFalse(email.test_connection("", 587, True, "", "")["ok"])
+
+    def test_success_with_tls_and_login(self):
+        with mock.patch("notifier.email.smtplib.SMTP") as smtp:
+            server = smtp.return_value.__enter__.return_value
+            result = email.test_connection("smtp.test", 587, True, "user", "pw")
+        self.assertTrue(result["ok"])
+        server.starttls.assert_called_once()
+        server.login.assert_called_once_with("user", "pw")
+
+    def test_no_login_when_username_empty(self):
+        with mock.patch("notifier.email.smtplib.SMTP") as smtp:
+            server = smtp.return_value.__enter__.return_value
+            email.test_connection("smtp.test", 25, False, "", "")
+        server.starttls.assert_not_called()
+        server.login.assert_not_called()
+
+    def test_failure_returns_error(self):
+        import smtplib
+
+        with mock.patch("notifier.email.smtplib.SMTP",
+                        side_effect=smtplib.SMTPAuthenticationError(535, b"bad")):
+            result = email.test_connection("smtp.test", 587, True, "user", "wrong")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["error"])
+
+
+class ProductSenders(unittest.TestCase):
+    """The product markdown already carries its own preview link, so the senders
+    must pass it through unchanged (no duplicated link) and only set the subject."""
+
+    def test_pir_passes_markdown_through_unchanged(self):
+        pir = SimpleNamespace(pir_id="PIR-001", question="What is the threat?")
+        md = "# PIR\n\nbody\n\n[Open PIR preview](http://x/p)"
+        with mock.patch("notifier.email.send_email", return_value=True) as send, \
+             mock.patch("notifier.email.product_email.markdown_html",
+                        return_value="<html>pir</html>") as markdown_html:
+            email.send_pir_notification(pir, md, channel_ids=["em1"])
+        _, subject, body, _ = send.call_args.args
+        self.assertEqual(body, md)
+        self.assertIn("PIR-001", subject)
+        markdown_html.assert_called_once()
+
+    def test_vea_subject_includes_cve_and_title(self):
+        vea = SimpleNamespace(vea_id="VEA-9", cve_id="CVE-2026-1", title="RCE")
+        with mock.patch("notifier.email.send_email", return_value=True) as send, \
+             mock.patch("notifier.email.product_email.markdown_html", return_value="<html>vea</html>") as markdown_html:
+            email.send_vea_notification(vea, "body")
+        subject = send.call_args.args[1]
+        self.assertIn("VEA-9", subject)
+        self.assertIn("CVE-2026-1", subject)
+        self.assertIn("RCE", subject)
+        markdown_html.assert_called_once()
+
+    def test_flash_intel_subject_uses_fia_tlp_not_markdown_parsing(self):
+        fia = SimpleNamespace(fia_id="FIA-001", tlp="red")
+        content = "# Flash intel alert\n\nBody without classification metadata"
+        with mock.patch("notifier.email.send_email", return_value=True) as send, \
+             mock.patch("notifier.email.product_email.markdown_html", return_value="<html>fia</html>") as markdown_html:
+            email.send_flash_intel_alert(fia, content)
+        subject = send.call_args.args[1]
+        self.assertEqual(subject, "[CTI] TLP:RED - FIA-001: Flash Intel Alert")
+        markdown_html.assert_called_once()
+
+    def test_a_classified_product_shows_the_tlp_its_subject_claims(self):
+        """The badge comes from the product object, not from parsing the markdown.
+        A renderer that states the classification as prose (threat actor profiles)
+        or a model that leaves the line out (analyser drafts) would otherwise mail
+        a product whose subject and face disagree."""
+        bare = "# Product\n\n*classification stated as prose*\n\n## Summary\n\nBody."
+        for send_product in (
+            lambda: email.send_rfi_notification(
+                SimpleNamespace(rfi_id="RFI-1", question="q", deliverable_tlp="red"), bare),
+            lambda: email.send_vea_notification(
+                SimpleNamespace(vea_id="VEA-1", cve_id="CVE-1", title="t", tlp="red"), bare),
+            lambda: email.send_threat_actor_profile_notification(
+                SimpleNamespace(tap_id="TAP-1", title="t", tlp="red"), bare),
+            lambda: email.send_flash_intel_alert(
+                SimpleNamespace(fia_id="FIA-1", tlp="red"), bare),
+            lambda: email.send_indicator_feed_notification(
+                SimpleNamespace(feed_id="IF-1", name="n", tlp="red"), bare),
+        ):
+            with mock.patch.object(email, "send_email", return_value=True) as send:
+                send_product()
+            self.assertIn("TLP:RED", send.call_args.args[1])
+            self.assertIn("TLP:RED", send.call_args.kwargs["html_body"])
+
+    def test_a_requirement_carries_no_classification_at_all(self):
+        with mock.patch.object(email, "send_email", return_value=True) as send:
+            email.send_pir_notification(SimpleNamespace(pir_id="PIR-1", question="q"), "# PIR")
+        self.assertNotIn("TLP:", send.call_args.args[1])
+        self.assertNotIn("TLP:", send.call_args.kwargs["html_body"])
+
+
+
+class ThreatActorProfileMail(unittest.TestCase):
+    """The Diamond Model arrived as a separate diamond-model.png attachment
+    instead of in the body where the PDF shows it."""
+
+    MARKDOWN = ("# Actor X\n\n**ID:** TAP-1\n**Classification:** TLP:AMBER\n\n"
+                "## Summary\n\nWhat they do.\n\n## Threat actor details\n\n**Synonyms:** Bear\n\n"
+                "## Attribution\n\nWhy we think so.\n")
+
+    def setUp(self):
+        self._orig = {k: getattr(config, k, None) for k in
+                      ("SMTP_HOST", "SMTP_FROM", "NOTIFICATION_CHANNELS")}
+        config.SMTP_HOST = "smtp.x.test"
+        config.SMTP_FROM = "cti@x.test"
+        config.NOTIFICATION_CHANNELS = [
+            {"id": "em1", "name": "SOC", "type": "email", "recipient": "soc@x.test", "enabled": True},
+        ]
+
+    def tearDown(self):
+        for key, value in self._orig.items():
+            setattr(config, key, value)
+
+    def _sent(self, diamond_png):
+        tap = SimpleNamespace(tap_id="TAP-1", title="Actor X", tlp="amber")
+        with mock.patch("notifier.email.smtplib.SMTP") as smtp:
+            server = smtp.return_value.__enter__.return_value
+            self.assertTrue(email.send_threat_actor_profile_notification(
+                tap, self.MARKDOWN, diamond_png=diamond_png))
+        return server.send_message.call_args.args[0]
+
+    def test_the_diamond_model_is_inline_in_the_html(self):
+        msg = self._sent(b"\x89PNG diamond")
+        diamond = [p for p in msg.walk() if p.get("Content-ID") == "<diamondmodel>"]
+        self.assertEqual(len(diamond), 1)
+        self.assertEqual(diamond[0].get_content_type(), "image/png")
+        self.assertEqual(diamond[0].get_content_disposition(), "inline")
+        self.assertEqual(diamond[0].get_content(), b"\x89PNG diamond")
+        # It sits inside the multipart/related that wraps the HTML, not beside it.
+        related = [p for p in msg.walk() if p.get_content_type() == "multipart/related"]
+        self.assertEqual(len(related), 1)
+        self.assertIn(diamond[0], related[0].get_payload())
+        html = next(p for p in msg.walk() if p.get_content_type() == "text/html").get_content()
+        self.assertIn('src="cid:diamondmodel"', html)
+        self.assertFalse(any(p.get_filename() == "diamond-model.png" for p in msg.walk()))
+
+    def test_the_plaintext_alternative_is_kept_and_does_not_name_the_image(self):
+        msg = self._sent(b"\x89PNG diamond")
+        plain = next(p for p in msg.walk() if p.get_content_type() == "text/plain").get_content()
+        self.assertIn("What they do.", plain)
+        self.assertNotIn("cid:", plain)
+
+    def test_the_diamond_sits_where_the_pdf_puts_it(self):
+        html = product_email.threat_actor_profile_html(self.MARKDOWN, "amber", with_diamond=True)
+        details = html.index("Threat actor details")
+        diamond = html.index("Diamond Model")
+        self.assertLess(details, diamond)
+        self.assertLess(diamond, html.index("Attribution"))
+
+    def test_a_profile_without_those_sections_still_shows_the_diamond(self):
+        html = product_email.threat_actor_profile_html("# Actor X\n\n## Summary\n\nx",
+                                                       "amber", with_diamond=True)
+        self.assertLess(html.index("Summary"), html.index("cid:diamondmodel"))
+
+    def test_without_a_diamond_there_is_no_image_reference(self):
+        msg = self._sent(None)
+        self.assertFalse(any(p.get("Content-ID") == "<diamondmodel>" for p in msg.walk()))
+        html = next(p for p in msg.walk() if p.get_content_type() == "text/html").get_content()
+        self.assertNotIn("cid:diamondmodel", html)
+        self.assertIn("Threat Actor Profile", html)
+
+
+class DetectionEngineeringRequestMail(unittest.TestCase):
+    def _sent(self, der):
+        with mock.patch.object(email, "send_email", return_value=True) as send:
+            email.send_detection_eng_request_notification(
+                der, "# Detection engineering request: Detect WMI\n\nbody", channel_ids=["em1"])
+        return send
+
+    def test_subject_has_the_id_title_and_classification(self):
+        send = self._sent(SimpleNamespace(der_id="DER-00042", title="Detect WMI", tlp="amber"))
+        self.assertEqual(send.call_args.args[1], "[CTI] TLP:AMBER - DER-00042: Detect WMI")
+        self.assertEqual(send.call_args.args[3], "DER DER-00042")
+
+    def test_an_untitled_request_is_named_by_its_id_alone(self):
+        send = self._sent(SimpleNamespace(der_id="DER-00042", title="", tlp="amber"))
+        self.assertTrue(send.call_args.args[1].endswith("DER-00042"))
+
+    def test_the_html_body_is_labelled_and_classified(self):
+        send = self._sent(SimpleNamespace(der_id="DER-00042", title="Detect WMI", tlp="red"))
+        html = send.call_args.kwargs["html_body"]
+        self.assertIn("Detection Engineering Request", html)
+        self.assertIn("TLP:RED", html)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,316 @@
+{% macro ai_job_badge(job) %}
+{# What the drafting job is doing to a briefing, for the list and the detail
+   page. Anything older than the job store's day is simply not shown. #}
+{% if job and job.action == 'briefing-draft' %}
+  {% if job.status in ('queued', 'running') %}
+    <span class="badge text-bg-info" title="{{ job.message }}">
+      <i class="fas fa-wand-magic-sparkles me-1"></i>AI drafting</span>
+  {% elif job.status == 'completed' %}
+    <span class="badge text-bg-light border" title="{{ job.message }}">
+      <i class="fas fa-wand-magic-sparkles me-1"></i>AI finished</span>
+  {% elif job.status == 'failed' %}
+    <span class="badge text-bg-warning" title="{{ job.error or job.message }}">
+      <i class="fas fa-wand-magic-sparkles me-1"></i>AI failed</span>
+  {% endif %}
+{% endif %}
+{% endmacro %}
+
+{% macro focus_mark(names, value) %}
+{# The bullseye on a scope value that is one of the organisation-wide focus
+   points. ``names`` is that category's {lower-cased name: name}. #}
+{% if names and value | lower in names %}<i class="fas fa-bullseye focus-mark" title="Also a focus point of the organisation"></i>{% endif %}
+{% endmacro %}
+
+
+{% macro tag_input(field, values=[], datalist_id=None, placeholder="Type and press Enter to add", focus=None) %}
+{# ``focus`` is the {lower-cased name: name} of the focus points a value gets the bullseye for. #}
+<div data-ti-field="{{ field }}"{% if focus %} data-ti-focus='{{ focus | tojson }}'{% endif %}>
+  <div class="input-group input-group-sm">
+    <input type="text" id="ti-text-{{ field }}" class="form-control form-control-sm"
+           {% if datalist_id %}list="{{ datalist_id }}"{% endif %}
+           placeholder="{{ placeholder }}" autocomplete="off">
+    <button type="button" class="btn btn-sm btn-outline-secondary ti-add">
+      <i class="fas fa-plus"></i>
+    </button>
+  </div>
+  <div id="ti-display-{{ field }}" class="ti-display d-flex flex-wrap gap-1 mt-2"></div>
+  <div id="ti-store-{{ field }}" style="display:none;">
+    {% for v in values %}
+    <input type="hidden" name="{{ field }}" value="{{ v | e }}">
+    {% endfor %}
+  </div>
+</div>
+{% endmacro %}
+
+
+{% macro galaxy_multiselect(field, values=[], items=[], dom_id=None, focus=None) %}
+{# Scrollable checkbox list for galaxy-backed fields.
+   Falls back to a tag input when MISP is unreachable and items is empty.
+   Selected values (and any custom values not present in items) are pinned
+   at the top so the user can see what is already selected.
+   ``dom_id`` makes the DOM ids unique when the macro is used multiple
+   times with the same form ``field`` name on one page. ``focus`` is the
+   {lower-cased name: name} of the focus points an item gets the bullseye for. #}
+{% set dkey = dom_id or field %}
+{% if items %}
+<input type="text" class="form-control form-control-sm mb-1" data-gms-search="{{ dkey }}"
+       placeholder="Filter…" autocomplete="off">
+{# Build an ordered list with case-insensitive dedup.
+   Selected items come first, using the canonical galaxy casing where possible.
+   Then unmatched stored values (no canonical equivalent), then remaining items. #}
+{% set values = values | galaxy_values(items) %}
+{% set values_lower = values | map('lower') | list %}
+{% set ordered = [] %}
+{% set ordered_lower = [] %}
+{% for item in items %}{% if item | lower in values_lower and item | lower not in ordered_lower %}{% set _ = ordered.append(item) %}{% set _ = ordered_lower.append(item | lower) %}{% endif %}{% endfor %}
+{% for v in values %}{% if v | lower not in ordered_lower %}{% set _ = ordered.append(v) %}{% set _ = ordered_lower.append(v | lower) %}{% endif %}{% endfor %}
+{% for item in items %}{% if item | lower not in ordered_lower %}{% set _ = ordered.append(item) %}{% set _ = ordered_lower.append(item | lower) %}{% endif %}{% endfor %}
+<div class="gms-list" id="gms-{{ dkey }}">
+  {% for item in ordered %}
+  <label class="gms-item">
+    <input type="checkbox" name="{{ field }}" value="{{ item | e }}"
+           {% if item | lower in values_lower %}checked{% endif %}{% if focus and item | lower in focus %} data-focus{% endif %}>
+    <span>{{ item }}</span>{{ focus_mark(focus, item) }}
+  </label>
+  {% endfor %}
+</div>
+<div class="gms-selected-display mt-1" id="gms-selected-{{ dkey }}"></div>
+{% else %}
+<div class="form-text text-warning mb-1"><i class="fas fa-triangle-exclamation me-1"></i>Galaxy data unavailable. Enter values manually.</div>
+{{ tag_input(field, values=values, placeholder="Type and press Enter to add", focus=focus) }}
+{% endif %}
+{% endmacro %}
+
+
+
+{% macro review_state_badge(review_state) %}
+{# Where a product stands in review, in the colours the rest of the app uses for
+   it. The detail and review pages still spell this out inline. #}
+{% if review_state == 'approved' %}<span class="badge bg-success">approved</span>
+{% elif review_state == 'published' %}<span class="badge bg-success">published</span>
+{% elif review_state == 'rejected' %}<span class="badge bg-danger">rejected</span>
+{% elif review_state in ('pending-review', 'internal-review', 'stakeholder-review') %}<span class="badge bg-info text-dark">{{ review_state | replace('-', ' ') }}</span>
+{% else %}<span class="badge bg-secondary">{{ review_state }}</span>{% endif %}
+{% endmacro %}
+
+
+{% macro audience_badges(audience, limit=None) %}
+{# The roles a product is for, under its title on the product lists. A list
+   passes ``limit`` so a product for every role does not make its row tall. #}
+{% set roles = (audience or '').split(',') | map('trim') | select | list %}
+{% if roles %}
+<div class="mt-1">
+  {% for role in roles[:limit] %}
+  <span class="badge chip-source" style="font-size:.63rem;">{{ role }}</span>
+  {% endfor %}
+  {% if limit and roles | length > limit %}<span class="text-muted small" title="{{ roles[limit:] | join(', ') }}">+{{ roles | length - limit }} more</span>{% endif %}
+</div>
+{% endif %}
+{% endmacro %}
+
+{% macro story_scope(story, chip_class='scope-chip') %}
+{# Labelled scope rows under a briefing story, shared by the detail page, the
+   list preview and the PDF. The rows come from misp_store, so the labels and
+   their order match the markdown and the HTML e-mail. `chip_class` picks the
+   surface's chip style (scope-chip on screen, scope-tag in print). #}
+{% for label, values in story | scope_rows %}
+<div class="scope-row"><span class="pretext">{{ label }}:</span>
+  {% for v in values %}<span class="{{ chip_class }}">{{ v }}</span>{% endfor %}</div>
+{% endfor %}
+{% if story.source_reliability or story.information_credibility %}
+<div class="scope-row"><span class="pretext">Admiralty scale:</span>
+  <span class="{{ chip_class }}" title="source reliability / information credibility">{{ story.source_reliability or '-' }}/{{ story.information_credibility or '-' }}</span></div>
+{% endif %}
+{% if story.cti_evaluation %}
+<div class="scope-row"><span class="pretext">CTI evaluation:</span>
+  {% for k, v in story.cti_evaluation.items() %}<span class="{{ chip_class }}">{{ k }}={{ v }}</span>{% endfor %}</div>
+{% endif %}
+{% endmacro %}
+
+{% macro feed_downloads(feed=None, query_string='', size='sm') %}
+{# The formats an indicator feed is served in, as download buttons, in the order
+   an analyst is most likely to want them. A feed with an id downloads by that
+   id; one that is not saved yet sends its current filters along in the URL. #}
+{% for fmt, icon, label in [('csv', 'fa-file-csv', 'CSV'), ('txt', 'fa-list', 'Values'),
+                            ('tsv', 'fa-table-list', 'Type + value'), ('json', 'fa-code', 'JSON')] %}
+{# `download` marks these as what they are: the response is an attachment and
+   the page stays put, which is also what keeps the unsaved-changes guard from
+   asking about a download. #}
+<a href="{{ url_for('indicator_feed.download_feed', id=feed.id, fmt=fmt) if feed and feed.id
+             else (url_for('indicator_feed.download', fmt=fmt) ~ '?' ~ query_string) }}"
+   download class="btn btn-{{ size }} btn-outline-secondary text-nowrap" title="Download {{ label }}">
+  <i class="fas {{ icon }} me-1"></i>{{ label }}</a>
+{% endfor %}
+{# Not a format of the result but the search itself, to run without zsazsa. #}
+<a href="{{ url_for('indicator_feed.pymisp_script_feed', id=feed.id) if feed and feed.id
+             else (url_for('indicator_feed.pymisp_script') ~ '?' ~ query_string) }}"
+   download class="btn btn-{{ size }} btn-outline-secondary text-nowrap"
+   title="Download the search as a PyMISP script, reading MISP_URL and MISP_KEY from the environment">
+  <i class="fab fa-python me-1"></i>PyMISP</a>
+{% endmacro %}
+
+{% macro remove_secret(name, label) %}
+{# Secret fields are shown empty and an empty one keeps what is stored, so
+   taking a secret away needs a box of its own. #}
+<div class="form-check mt-1">
+  <input class="form-check-input" type="checkbox" name="remove_{{ name }}" value="true" id="remove-{{ name }}">
+  <label class="form-check-label small text-muted" for="remove-{{ name }}">{{ label }}</label>
+</div>
+{% endmacro %}
+
+{# The icon each CTI product has in the Products menu, for every other place
+   that lists products. A product an admin added has no menu entry and gets the
+   cube. #}
+{% set product_icons = {
+  'Daily threat briefing': 'newspaper',
+  'Threat landscape report': 'globe',
+  'Flash intel alert': 'bolt',
+  'Vulnerability advisory': 'bug',
+  'Threat actor profile': 'user-secret',
+  'Indicator feed': 'satellite-dish',
+  'Detection engineering request': 'crosshairs',
+  'Campaign profile': 'flag',
+  'Incident response support': 'kit-medical',
+  'Hunt support': 'binoculars',
+} %}
+
+{% macro product_icon(name) %}<i class="fas fa-{{ product_icons.get(name, 'cube') }} fa-fw text-muted me-1"></i>{% endmacro %}
+
+{# The sources from misp_store.collection_source_groups() as checkboxes, under
+   the headings and with the icons the sources page uses, ticked when named in
+   `selected`. #}
+{% macro collection_source_checklist(groups, selected) %}
+{% set headings = {'scraper': 'MISP scraper', 'misp': 'Other MISP servers',
+                   'imap': 'IMAP mailboxes', 'manual': 'Manual sources'} %}
+{% set icons = {'misp': 'server', 'imap': 'envelope', 'manual': 'hand'} %}
+<div class="source-checklist">
+  {% for kind, names in groups.items() if names %}
+  <div class="w-100 small text-muted fw-semibold {{ 'mt-2' if not loop.first }}">{{ headings[kind] }}</div>
+  {% for name in names %}
+  <div class="form-check form-check-inline source-check">
+    <input class="form-check-input" type="checkbox" name="collection_sources" value="{{ name }}"
+           id="src_{{ kind }}_{{ loop.index }}" {{ 'checked' if name in selected }}>
+    <label class="form-check-label" for="src_{{ kind }}_{{ loop.index }}">
+      {%- if kind == 'scraper' -%}
+      <img src="{{ url_for('static', filename='misp-logo.png') }}" alt="" style="height:12px;width:auto;margin-right:5px;opacity:.8;">
+      {%- else -%}
+      <i class="fas fa-{{ icons[kind] }} fa-fw text-muted me-1"></i>
+      {%- endif -%}
+      {{ name }}
+    </label>
+  </div>
+  {% endfor %}
+  {% endfor %}
+</div>
+{% endmacro %}
+
+{# The questions answered at triage, as checkboxes on an edit form. `checklist`
+   is the (value, label) list the route passes, `saved` the stored answers. #}
+{% macro triage_checklist_card(checklist, saved) %}
+<div class="card content-card mb-4">
+  <div class="card-header"><i class="fas fa-clipboard-check me-2"></i>Intake checklist</div>
+  <div class="card-body">
+    <div class="form-text mt-0 mb-2">The answers given at triage. Changing them here leaves the triage decision as it is.</div>
+    {% for value, label in checklist %}
+    <div class="form-check mb-2">
+      <input class="form-check-input" type="checkbox" name="triage_checklist" value="{{ value }}"
+             id="triage_chk_{{ loop.index }}" {{ 'checked' if value in saved }}>
+      <label class="form-check-label small" for="triage_chk_{{ loop.index }}">{{ label }}</label>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endmacro %}
+
+{# An icon that ticks every checkbox `target` (a CSS selector) finds, or clears
+   them once all are ticked. The script for it is in base.html. #}
+{% macro toggle_all_button(target, select_title, clear_title) %}
+<button type="button" class="btn btn-sm btn-link text-muted p-0" data-toggle-all="{{ target }}"
+        data-select-title="{{ select_title }}" data-clear-title="{{ clear_title }}"
+        title="{{ select_title }}" aria-label="{{ select_title }}">
+  <i class="fas fa-check-double"></i>
+</button>
+{% endmacro %}
+
+
+{% macro status_menu(label, current, targets, url) %}
+{# The "Move to" menu of a PIR, GIR or RFI on its list: the statuses ``targets``
+   allows from ``current``, each asked for first. _status_move_js.html sends it. #}
+{% set moves = targets | reject('equalto', current) | list %}
+{% if moves %}
+<div class="dropdown d-inline-block">
+  <button type="button" class="btn btn-xs btn-outline-primary" data-bs-toggle="dropdown" aria-expanded="false"
+          data-bs-popper-config='{"strategy":"fixed"}' title="Change the status of {{ label }}" aria-label="Change the status of {{ label }}">
+    <i class="fas fa-arrow-right-arrow-left"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><h6 class="dropdown-header">Move {{ label }} to</h6></li>
+    {% for status in moves %}
+    <li><button type="button" class="dropdown-item" data-status-to="{{ status }}" data-update-url="{{ url }}"
+                data-confirm="Move {{ label }} to {{ status }}?">{{ status }}</button></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% endmacro %}
+
+
+{% macro lifecycle(label, current, statuses, targets, url, note='') %}
+{# A record's ``statuses`` in their order with the current one marked, and a
+   move to each of ``targets``. ``note`` says why there are none. #}
+{% set at = statuses.index(current) if current in statuses else -1 %}
+<ol class="lifecycle">
+  {% for status in statuses %}
+  <li class="{{ 'now' if status == current else ('done' if loop.index0 < at else '') }}">
+    <span class="dot" aria-hidden="true"></span><span>{{ status }}</span>
+    {% if status != current and status in targets %}
+    <button type="button" class="btn btn-xs btn-outline-secondary" data-status-to="{{ status }}" data-update-url="{{ url }}"
+            data-confirm="Move {{ label }} to {{ status }}?">Move here</button>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ol>
+{% if note %}<p class="small text-muted mb-0 mt-2">{{ note }}</p>{% endif %}
+{% endmacro %}
+
+{# A daily briefing's date (YYYY-MM-DD) as a calendar leaf: the month on a band
+   in the colour of its review state ('draft', 'rejected', or published), the
+   day under it. #}
+{% macro date_leaf(date, state='') -%}
+{%- set parts = (date or '').split('-') -%}
+{%- set month = parts[1] | int if parts | length == 3 else 0 -%}
+<span class="date-leaf {{ state }}" aria-hidden="true"><b>{{ ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][month - 1] if 1 <= month <= 12 else '' }}</b><span>{{ parts[2] | int if parts | length == 3 else '?' }}</span></span>
+{%- endmacro %}
+
+{# The last delivery of a product, one line per step of its trail. The trail is
+   the audit entry notify_jobs writes, its messages joined with "; ". #}
+{% macro notify_card(status, resend_url='') %}
+<div class="card content-card mb-3" id="notify-card">
+  <div class="card-header"><i class="fas fa-bell me-2"></i>Last notification</div>
+  <div class="card-body">
+    <div class="d-flex align-items-center gap-2 mb-2">
+      <span class="badge bg-{{ status.tone }}">{{ status.label }}</span>
+      <span class="small text-muted">{{ status.timestamp }}</span>
+    </div>
+    {% if status.details %}
+    <ul class="list-unstyled small mb-2 notify-trail">
+      {% for line in status.details.split('; ') if line.strip() %}
+      {% set bad = 'fail' in line.lower() or 'could not' in line.lower() or 'error' in line.lower() %}
+      <li title="{{ line }}"><i class="fas {{ 'fa-xmark text-danger' if bad else 'fa-check text-success' }} me-2"></i>{{ line | truncate(110) }}</li>
+      {% endfor %}
+    </ul>
+    {% if status.details | length > 200 %}
+    <details class="small mb-2"><summary class="text-muted">The full message</summary>
+      <div class="mt-1 text-muted" style="word-break:break-word;">{{ status.details }}</div></details>
+    {% endif %}
+    {% endif %}
+    {% if resend_url %}
+    <form method="post" action="{{ resend_url }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="detail">
+      <button class="btn btn-sm btn-outline-primary w-100 mt-1"><i class="fas fa-paper-plane me-1"></i> Resend</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+{% endmacro %}

@@ -1,0 +1,385 @@
+{# Data-dependent dashboard sections, loaded asynchronously by dashboard.html.
+   Everything here needs MISP/DB queries; keeping it out of the initial page
+   render lets the shell (action bar) paint immediately. #}
+{% import "_charts.html" as charts %}
+
+{# Onboarding helper: appears until zsazsa has sources and focus points, and
+   both a stakeholder and a PIR exist. Only a site admin can open the wizard. #}
+{% set show_wizard = setup_needed and is_site_admin %}
+{% if show_wizard or stakeholder_count == 0 or pir_count == 0 %}
+<div class="card content-card mb-4 border-primary">
+  <div class="card-header bg-primary text-white">
+    <i class="fas fa-rocket me-2"></i>Get started
+  </div>
+  <div class="card-body">
+    <ol class="onboarding-steps mb-0" style="list-style:none;padding:0;display:flex;gap:1.5rem;flex-wrap:wrap;margin:0;">
+      {% if show_wizard %}
+      <li class="d-flex align-items-start gap-3" style="flex:1 1 280px;">
+        <div style="font-size:1.5rem;color:var(--accent-blue);"><i class="fas fa-wand-magic-sparkles"></i></div>
+        <div>
+          <div class="fw-semibold">Finish setting up zsazsa</div>
+          <p class="text-muted small mb-2">Tell zsazsa where its events come from and what matters to you, and set up AI and notifications.</p>
+          <a href="{{ url_for('setup_wizard.start') }}" class="btn btn-sm btn-primary">
+            <i class="fas fa-play me-1"></i> Open the setup wizard
+          </a>
+        </div>
+      </li>
+      {% endif %}
+      <li class="d-flex align-items-start gap-3" style="flex:1 1 280px;">
+        <div style="font-size:1.5rem;color:{{ 'var(--accent-green)' if stakeholder_count > 0 else 'var(--accent-blue)' }};">
+          {% if stakeholder_count > 0 %}
+            <i class="fas fa-circle-check"></i>
+          {% else %}
+            <span class="badge rounded-circle bg-primary" style="width:2rem;height:2rem;line-height:1.5rem;font-size:1rem;">1</span>
+          {% endif %}
+        </div>
+        <div>
+          <div class="fw-semibold">{{ 'Have you not forgotten someone?' if stakeholder_count > 0 else 'Create your first stakeholder' }}</div>
+          <p class="text-muted small mb-2">Stakeholders are the people who consume your CTI output and who own intelligence requirements.</p>
+          {% if stakeholder_count == 0 %}
+          <a href="{{ url_for('stakeholders.new') }}" class="btn btn-sm btn-primary">
+            <i class="fas fa-plus me-1"></i> New stakeholder
+          </a>
+          {% else %}
+          <a href="{{ url_for('stakeholders.list') }}" class="text-success small"><i class="fas fa-check me-1"></i>{{ stakeholder_count }} stakeholder{{ 's' if stakeholder_count != 1 }} registered</a>
+          {% endif %}
+        </div>
+      </li>
+      <li class="d-flex align-items-start gap-3" style="flex:1 1 280px;">
+        <div style="font-size:1.5rem;color:{{ 'var(--accent-green)' if pir_count > 0 else ('var(--accent-blue)' if stakeholder_count > 0 else 'var(--icon-muted-grey)') }};">
+          {% if pir_count > 0 %}
+            <i class="fas fa-circle-check"></i>
+          {% else %}
+            <span class="badge rounded-circle {{ 'bg-primary' if stakeholder_count > 0 else 'bg-secondary' }}" style="width:2rem;height:2rem;line-height:1.5rem;font-size:1rem;">2</span>
+          {% endif %}
+        </div>
+        <div>
+          <div class="fw-semibold">Define one or more PIRs for those stakeholders</div>
+          <p class="text-muted small mb-2">A Priority Intelligence Requirement frames a specific intelligence question tied to a stakeholder decision.</p>
+          {% if pir_count == 0 %}
+            {% if stakeholder_count > 0 %}
+            <a href="{{ url_for('requirements.pir_new') }}" class="btn btn-sm btn-primary">
+              <i class="fas fa-plus me-1"></i> New PIR
+            </a>
+            {% else %}
+            <span class="text-muted small">Add a stakeholder first.</span>
+            {% endif %}
+          {% else %}
+          <a href="{{ url_for('requirements.pir_list') }}" class="text-success small"><i class="fas fa-check me-1"></i>{{ pir_count }} PIR{{ 's' if pir_count != 1 }} defined</a>
+          {% endif %}
+        </div>
+      </li>
+    </ol>
+  </div>
+</div>
+{% endif %}
+
+{# What waits on the analyst. The dashboard moves this card beside the
+   collection pipeline as it arrives. #}
+{% set waits = pending_email_sources or to_review or pending_feedback %}
+<div class="card content-card rise rise-1" id="waiting-on-you">
+  <div class="card-header"><i class="fas fa-inbox me-2"></i>Waiting on you</div>
+  {% if waits %}
+  <ul class="needs">
+    {% if pending_email_sources %}
+    <li style="--t:var(--accent-orange);">
+      <span class="stat-icon icon-sm"><i class="fas fa-envelope-open-text"></i></span>
+      <span class="min-w-0"><span class="what d-block">{{ pending_email_sources }} email source{{ 's' if pending_email_sources != 1 }}</span>
+        <span class="why">archived by the IMAP collector and awaiting review{% if oldest_email_source %}, the oldest since {{ oldest_email_source }}{% endif %}</span></span>
+      <a href="{{ url_for('data_collection.newsletter_pending') }}" class="btn btn-sm btn-outline-primary">Review</a>
+    </li>
+    {% endif %}
+{% if to_review %}
+{# What the analyser and the analysts left for a review, per kind of product:
+   its label, icon, list and the state its list filters a count on. A threat
+   landscape list has no state filter. #}
+{% set review_kinds = {
+  'briefing': ('Daily briefings', 'fa-newspaper', 'daily_briefing.list_briefings', {'drafts': 'draft'}),
+  'threat-landscape': ('Threat landscapes', 'fa-globe', 'threat_landscape.review', {}),
+  'flash-intel': ('Flash intel alerts', 'fa-bolt', 'flash_intel.review', {'review': 'pending-review', 'drafts': 'draft'}),
+  'vea': ('Vuln advisories', 'fa-bug', 'vea.review', {'review': 'pending-review', 'drafts': 'draft'}),
+  'threat-actor-profile': ('Threat actor profiles', 'fa-user-secret', 'threat_actor_profile.review', {'drafts': 'Draft'}),
+  'detection-eng': ('Detection eng. requests', 'fa-crosshairs', 'detection_eng.review', {'review': 'pending-review', 'drafts': 'draft'}),
+} %}
+{% set review_color = charts.review_colors['pending-review'] %}
+{% set draft_color = charts.review_colors['draft'] %}
+{% set most = to_review | map(attribute='total') | max %}
+<li id="products-to-review" style="--t:var(--accent-blue);">
+  <span class="stat-icon icon-sm"><i class="fas fa-clipboard-check"></i></span>
+  <div class="min-w-0">
+    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="what">Products to review</span>
+    <span class="chart-legend">
+      <span><span class="chart-swatch" style="background:{{ review_color }};"></span>To review <strong>{{ to_review | sum(attribute='review') }}</strong></span>
+      <span><span class="chart-swatch" style="background:{{ draft_color }};"></span>Draft <strong>{{ to_review | sum(attribute='drafts') }}</strong></span>
+    </span>
+    </div>
+    <div class="needs-rows">
+    {% for row in to_review %}
+    {% set label, icon, endpoint, states = review_kinds[row.kind] %}
+    {% set counts = [] %}
+    {% if row.review %}{% set counts = counts + [('review', row.review ~ ' to review')] %}{% endif %}
+    {% if row.drafts %}{% set counts = counts + [('drafts', row.drafts ~ ' draft' ~ ('s' if row.drafts != 1 else ''))] %}{% endif %}
+    <div class="chart-row">
+      <span class="rank"><i class="fas {{ icon }}"></i></span>
+      <span class="d-block" style="min-width:0;">
+        <span class="name"><a href="{{ url_for(endpoint) }}" class="text-reset">{{ label }}</a>
+          <span class="text-muted">·
+          {%- for part, text in counts %} {% if states.get(part) -%}
+            <a href="{{ url_for(endpoint, state=states[part]) }}" class="text-reset">{{ text }}</a>
+          {%- else %}{{ text }}{% endif %}{{ ',' if not loop.last }}{% endfor %}</span></span>
+        <span class="chart-bar" style="width:{{ (row.total / most * 100) | round(1) }}%;">
+          {% if row.review %}<span style="flex:{{ row.review }};background:{{ review_color }};" title="{{ row.review }} to review"></span>{% endif %}
+          {% if row.drafts %}<span style="flex:{{ row.drafts }};background:{{ draft_color }};" title="{{ row.drafts }} draft{{ 's' if row.drafts != 1 }}"></span>{% endif %}
+        </span>
+      </span>
+      <span class="chart-pill">{{ row.total }}</span>
+    </div>
+    {% endfor %}
+    </div>
+  </div>
+</li>
+{% endif %}
+{% if pending_feedback %}
+<li id="awaiting-feedback" style="--t:var(--accent-red);">
+  <span class="stat-icon icon-sm"><i class="fas fa-comment-dots"></i></span>
+  <div class="min-w-0">
+  <span class="what">Awaiting feedback <span class="badge rounded-pill bg-primary ms-1">{{ pending_feedback | length }}</span></span>
+  <div class="list-group list-group-flush mt-1">
+    {% for p in pending_feedback %}
+    <a href="{{ url_for('flash_intel.detail', id=p.uuid) if p.kind == 'flash-intel' else url_for('vea.detail', id=p.uuid) }}"
+       class="list-group-item list-group-item-action d-flex align-items-center justify-content-between gap-3">
+      <span class="d-flex align-items-center gap-2 text-truncate">
+        {% if p.kind == 'flash-intel' %}
+        <span class="badge rounded-pill text-bg-danger flex-shrink-0"><i class="fas fa-bolt me-1"></i>FIA</span>
+        {% else %}
+        <span class="badge rounded-pill text-bg-warning text-dark flex-shrink-0"><i class="fas fa-bug me-1"></i>VEA</span>
+        {% endif %}
+        <span class="fw-semibold flex-shrink-0">{{ p.product_id }}</span>
+        <span class="text-muted text-truncate">{{ p.title }}</span>
+      </span>
+      <span class="d-flex align-items-center gap-2 flex-shrink-0">
+        {% if p.overdue %}
+        <span class="badge text-bg-danger"><i class="fas fa-triangle-exclamation me-1"></i>Overdue {{ -p.days_left }}d</span>
+        {% elif p.days_left == 0 %}
+        <span class="badge text-bg-warning text-dark">Due today</span>
+        {% else %}
+        <span class="badge text-bg-light text-dark border">Due in {{ p.days_left }}d</span>
+        {% endif %}
+        <span class="small text-muted d-none d-md-inline">{{ p.deadline.strftime('%d-%m-%Y') }}</span>
+      </span>
+    </a>
+    {% endfor %}
+  </div>
+  </div>
+</li>
+{% endif %}
+  </ul>
+  {% else %}
+  <div class="card-body d-flex align-items-center gap-2 text-muted small">
+    <i class="fas fa-circle-check text-success"></i>
+    Nothing waits on you: no email sources to review, no products to approve and no feedback due.
+  </div>
+  {% endif %}
+</div>
+
+<div class="dash-head mt-4"><h2>The program</h2><span class="rule"></span></div>
+<div class="card content-card count-strip rise rise-2 mb-4">
+  {% for n, label, icon, color, endpoint in [
+       (stakeholder_count, 'Stakeholder' ~ ('s' if stakeholder_count != 1 else ''), 'fa-users', 'var(--accent-orange)', 'stakeholders.list'),
+       (pir_count, 'Priority Intelligence Requirement' ~ ('s' if pir_count != 1 else ''), 'fa-star', 'var(--accent-blue)', 'requirements.pir_list'),
+       (gir_count, 'General Intelligence Requirement' ~ ('s' if gir_count != 1 else ''), 'fa-list-check', 'var(--accent-green)', 'requirements.gir_list'),
+       (rfi_count, 'Request' ~ ('s' if rfi_count != 1 else '') ~ ' for Information', 'fa-circle-question', 'var(--accent-purple)', 'rfi.rfi_list')] %}
+  <a href="{{ url_for(endpoint) }}" style="--icon-color:{{ color }};">
+    <span class="stat-icon icon-sm" aria-hidden="true"><i class="fas {{ icon }}"></i></span>
+    <span><b>{{ n }}</b><span class="lbl">{{ label }}</span></span>
+  </a>
+  {% endfor %}
+</div>
+
+<div class="row g-4">
+
+  <!-- Active PIRs -->
+  <div class="col-lg-6">
+    <div class="card content-card chart-card h-100" style="--icon-color:var(--accent-blue);">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <a href="{{ url_for('requirements.pir_list') }}" class="d-flex align-items-center gap-2 text-reset text-decoration-none"><span class="stat-icon icon-sm"><i class="fas fa-star"></i></span>Active PIRs</a>
+        <span class="d-flex align-items-center gap-2">
+          {% if active_pirs %}<span class="chart-badge">{{ active_pirs | length }} active</span>{% endif %}
+          <a href="{{ url_for('requirements.pir_new') }}" class="btn btn-xs btn-outline-primary" title="New PIR">
+            <i class="fas fa-plus"></i>
+          </a>
+        </span>
+      </div>
+      <div class="card-body p-0">
+        {% if active_pirs %}
+        <div class="chart-summary">{{ charts.mix('Priority', priority_counts, charts.priority_colors) }}</div>
+        <ul class="req-list">
+          {% for pir in active_pirs %}
+          <li class="req-item">
+            <a href="{{ url_for('requirements.pir_detail', id=pir.id) }}" class="req-link">
+              <span class="req-id">{{ pir.pir_id }}</span>
+              <span class="req-text">{{ pir.question | truncate(80) }}</span>
+            </a>
+            <div class="req-meta">
+              <span class="badge priority-badge priority-{{ pir.priority | slug }}">{{ pir.priority }}</span>
+              <span class="badge status-badge status-{{ pir.status | slug }}">{{ pir.status }}</span>
+            </div>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <div class="empty-state p-4">
+          <i class="fas fa-star-half-stroke text-muted"></i>
+          <p class="text-muted mb-0">No active PIRs yet.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <!-- Active GIRs -->
+  <div class="col-lg-6">
+    <div class="card content-card chart-card h-100" style="--icon-color:var(--accent-green);">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <a href="{{ url_for('requirements.gir_list') }}" class="d-flex align-items-center gap-2 text-reset text-decoration-none"><span class="stat-icon icon-sm"><i class="fas fa-list-check"></i></span>Active GIRs</a>
+        <span class="d-flex align-items-center gap-2">
+          {% if active_girs %}<span class="chart-badge">{{ active_girs | length }} active</span>{% endif %}
+          <a href="{{ url_for('requirements.gir_new') }}" class="btn btn-xs btn-outline-success" title="New GIR">
+            <i class="fas fa-plus"></i>
+          </a>
+        </span>
+      </div>
+      <div class="card-body p-0">
+        {% if active_girs %}
+        <div class="chart-summary">{{ charts.mix('Review cycle', cycle_counts, charts.cycle_colors) }}</div>
+        <ul class="req-list">
+          {% for gir in active_girs %}
+          <li class="req-item">
+            <a href="{{ url_for('requirements.gir_detail', id=gir.id) }}" class="req-link">
+              <span class="req-id">{{ gir.gir_id }}</span>
+              <span class="req-text">{{ gir.topic | truncate(80) }}</span>
+            </a>
+            <div class="req-meta">
+              <span class="badge status-badge status-active">{{ gir.status }}</span>
+              <span class="text-muted small">{{ gir.review_cycle }}</span>
+            </div>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <div class="empty-state p-4">
+          <i class="fas fa-list text-muted"></i>
+          <p class="text-muted mb-0">No active GIRs yet.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="dash-head mt-4"><h2>Where it comes from</h2><span class="rule"></span></div>
+<div class="row g-4">
+
+  <!-- Products by threat actor type -->
+  <div class="col-xl-4 col-lg-6">
+    <div class="card content-card chart-card h-100" style="--icon-color:var(--accent-blue);">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span class="d-flex align-items-center gap-2"><span class="stat-icon icon-sm"><i class="fas fa-user-shield"></i></span>Products by threat actor type</span>
+        <a href="{{ url_for('stats.index') }}" class="btn btn-xs btn-outline-secondary">Stats</a>
+      </div>
+      <div class="card-body">
+        {% if actor_type_products %}
+        {% set max_total = actor_type_products[0].total %}
+        <div class="chart-legend mb-2">
+          <span><span class="chart-swatch" style="background:var(--accent-blue);"></span>Daily briefings</span>
+          <span><span class="chart-swatch" style="background:var(--accent-orange);"></span>Flash intel</span>
+          <span><span class="chart-swatch" style="background:var(--accent-green);"></span>Threat actor profiles</span>
+        </div>
+        {% for row in actor_type_products %}
+        <div class="chart-row">
+          <span class="rank">{{ loop.index }}</span>
+          <span class="d-block" style="min-width:0;">
+            <span class="name" title="{{ row.actor_type }}">{{ row.actor_type }}</span>
+            <span class="chart-bar" style="width:{{ (row.total / max_total * 100) | round(1) }}%;">
+              {% if row.daily_briefings %}<span style="flex:{{ row.daily_briefings }};background:var(--accent-blue);" title="{{ row.daily_briefings }} daily briefing(s)"></span>{% endif %}
+              {% if row.flash_intel_alerts %}<span style="flex:{{ row.flash_intel_alerts }};background:var(--accent-orange);" title="{{ row.flash_intel_alerts }} flash intel alert(s)"></span>{% endif %}
+              {% if row.threat_actor_profiles %}<span style="flex:{{ row.threat_actor_profiles }};background:var(--accent-green);" title="{{ row.threat_actor_profiles }} threat actor profile(s)"></span>{% endif %}
+            </span>
+          </span>
+          <span class="chart-pill">{{ row.total }}</span>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="empty-state p-4">
+          <i class="fas fa-user-shield text-muted"></i>
+          <p class="text-muted mb-0">No products published yet.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <!-- Throughput by collection source -->
+  <div class="col-xl-4 col-lg-6">
+    <div class="card content-card chart-card h-100" style="--icon-color:var(--accent-green);">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span class="d-flex align-items-center gap-2"><span class="stat-icon icon-sm"><i class="fas fa-satellite-dish"></i></span>Throughput by collection source</span>
+        <a href="{{ url_for('pipeline.index') }}" class="btn btn-xs btn-outline-secondary">Details</a>
+      </div>
+      <div class="card-body">
+        {% if throughput_by_source %}
+        {% set max_n = throughput_by_source[0].n %}
+        {% for row in throughput_by_source %}
+        <div class="chart-row">
+          <span class="rank">{{ loop.index }}</span>
+          <span class="d-block" style="min-width:0;">
+            <span class="name" title="{{ row.source_feed or 'Unknown' }}">{{ row.source_feed or 'Unknown' }}</span>
+            <span class="chart-bar" style="width:{{ (row.n / max_n * 100) | round(1) }}%;"><span style="flex:1;background:var(--accent-green);"></span></span>
+          </span>
+          <span class="chart-pill">{{ row.n }}</span>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="empty-state p-4">
+          <i class="fas fa-satellite-dish text-muted"></i>
+          <p class="text-muted mb-0">No events processed yet.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <!-- Events held per source configured under Collection sources. The card
+       before it counts per collection-source tag, which is a different question. -->
+  <div class="col-xl-4 col-lg-6">
+    <div class="card content-card chart-card h-100" style="--icon-color:var(--misp-navy);">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span class="d-flex align-items-center gap-2"><span class="stat-icon icon-sm"><i class="fas fa-server"></i></span>By configured source</span>
+        <a href="{{ url_for('collection_sources.index') }}" class="btn btn-xs btn-outline-secondary">Sources</a>
+      </div>
+      <div class="card-body">
+        {% if configured_sources and configured_sources[0].events %}
+        {% set max_events = configured_sources[0].events %}
+        {% for row in configured_sources %}
+        <div class="chart-row">
+          <span class="rank">{{ loop.index }}</span>
+          <span class="d-block" style="min-width:0;">
+            <span class="name" title="{{ row.label }}">{{ row.label }}</span>
+            <span class="chart-bar" style="width:{{ (row.events / max_events * 100) | round(1) }}%;"><span style="flex:1;background:var(--misp-navy);"></span></span>
+          </span>
+          <span class="chart-pill">{{ row.events }}</span>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="empty-state p-4">
+          <i class="fas fa-server text-muted"></i>
+          <p class="text-muted mb-0">No events cached yet.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+</div>

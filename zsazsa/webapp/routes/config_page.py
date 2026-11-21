@@ -1,0 +1,2177 @@
+import importlib
+import json
+import logging
+import mimetypes
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import requests
+
+import config as _config
+from flask import Blueprint, flash, jsonify, redirect, render_template, request, send_file, url_for
+from markupsafe import escape
+from analyser import relevance, settings as analyser_settings
+from core import ai_connector, asset_inventory, flowintel_client
+from core.atomic_write import write_atomically
+from webapp import audit, misp_session, misp_store, newsletter_parsers
+from webapp.collection_cache import _split_tags, filter_events_by_org, partner_tag_filter
+from webapp.models import FOCUS_POINT_SETTINGS
+from webapp.rate_limit import rate_limited
+from webapp.routes import setup_wizard
+from webapp.utils import (
+    json_body as _json_object,
+    normalize_notification_channels as _normalize_notification_channels,
+    parse_bool as _parse_bool,
+    scraper_enabled,
+)
+
+bp = Blueprint("config_page", __name__)
+logger = logging.getLogger(__name__)
+
+_ROOT = Path(__file__).parent.parent.parent
+_UPLOADS_DIR = _ROOT / "data" / "uploads"
+_LOGO_MAX_BYTES = 2 * 1024 * 1024
+_CONFIG_FILE = _ROOT / "config" / "__init__.py"
+_BACKUP_FILE = _ROOT / "config" / "__init__.py.backup"
+_PROMPTS_DIR = _ROOT / "zsazsaprompts"
+
+# CTI products that can be linked to a Flowintel case template per instance.
+FLOWINTEL_CASE_TEMPLATE_PRODUCTS = [
+    {"key": "Flash intel alert", "label": "Flash intel report"},
+    {"key": "Vulnerability advisory", "label": "Vulnerability advisory"},
+]
+
+# Maintenance migration scripts that can be run from the System tab. Each entry's
+# "script" is resolved relative to the repository root and is the only path that
+# may be executed; the client only ever sends the migration "id". Scripts that
+# support a dry-run run without --apply first, then with --apply to commit.
+MIGRATIONS = [
+    {
+        "id": "make_zsazsa_tags_local",
+        "name": "Make zsazsa tags local",
+        "script": "scripts/make_zsazsa_tags_local.py",
+        "description": (
+            "Convert existing zsazsa-namespace tag attachments (zsazsa:type, "
+            "zsazsa:ctiproduct, zsazsa:source, ...) from global to local so they "
+            "never sync to connected MISP instances."
+        ),
+        "supports_apply": True,
+    },
+    {
+        "id": "rename_vea_subscription_product",
+        "name": "Rename VEA product in subscriptions",
+        "script": "scripts/rename_vea_subscription_product.py",
+        "description": (
+            "Rewrite the old \"Vulnerability exploitation advisory\" product name to "
+            "\"Vulnerability advisory\" in existing stakeholder subscriptions stored "
+            "in MISP, so they keep matching the renamed product."
+        ),
+        "supports_apply": True,
+    },
+    {
+        "id": "backfill_product_source_log",
+        "name": "Backfill product source log",
+        "script": "scripts/backfill_product_source_log.py",
+        "description": (
+            "Record the source events of existing products (briefings, flash intel, "
+            "VEAs) in the analyser log, so products created before source logging was "
+            "added show up under the pipeline's By collection source. Already-logged "
+            "entries are skipped, so it is safe to run more than once."
+        ),
+        "supports_apply": True,
+    },
+    {
+        "id": "convert_url_attributes_to_link",
+        "name": "Convert URL references to link",
+        "script": "scripts/convert_url_attributes_to_link.py",
+        "description": (
+            "Retype the external references on manual collection entries from MISP's "
+            "\"url\" type to \"link\". Entries created before this was fixed stored them "
+            "as \"url\", where nothing that builds a product's reference list picks them "
+            "up. Only External analysis attributes are touched, so genuine URL "
+            "indicators are left alone."
+        ),
+        "supports_apply": True,
+    },
+    {
+        "id": "align_requirement_scope_focus_points",
+        "name": "Align requirement scope and scope items",
+        "script": "scripts/align_requirement_scope_focus_points.py",
+        "description": (
+            "A PIR or GIR holds its scope both as lists on its object and as scope "
+            "items. Technology, vendor, incident and campaign were only ever written "
+            "to one of the two, so they were either invisible on the detail page or "
+            "matched nothing. This fills in whichever side is missing, in both "
+            "directions. Nothing is deleted and running it twice changes nothing."
+        ),
+        "supports_apply": True,
+    },
+    {
+        "id": "restore_rfi_ids",
+        "name": "Restore lost RFI ids",
+        "script": "scripts/restore_rfi_ids.py",
+        "description": (
+            "Before 1.0.0, saving feedback on an RFI sent an update carrying no id, "
+            "which took the id off the RFI and out of the event title. MISP still "
+            "holds it as a soft-deleted attribute, and this reads it back and puts "
+            "it in place. Run it only if some of your RFIs show no RFI-xxx id."
+        ),
+        "supports_apply": True,
+    },
+]
+
+_MIGRATIONS_BY_ID = {m["id"]: m for m in MIGRATIONS}
+
+
+def _llm_usage_stats(provider: str) -> dict:
+    """Return token usage totals for one provider from the analyser DB. Never raises."""
+    empty = {"total_calls": 0, "total_tokens": 0,
+             "today_calls": 0, "today_tokens": 0,
+             "week_calls": 0, "week_tokens": 0, "by_feature": []}
+    import sqlite3 as _sq
+    from contextlib import closing
+    db_path = getattr(_config, "DB_FILE", "data/analyser.db")
+    if not os.path.exists(db_path):
+        return empty
+    try:
+        with closing(_sq.connect(db_path)) as conn:
+            conn.row_factory = _sq.Row
+            r = conn.execute(
+                "SELECT COUNT(*) AS calls, COALESCE(SUM(total_tokens),0) AS tokens"
+                " FROM llm_usage WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+            r_today = conn.execute(
+                "SELECT COUNT(*) AS calls, COALESCE(SUM(total_tokens),0) AS tokens"
+                " FROM llm_usage WHERE provider = ? AND date(called_at) = date('now')",
+                (provider,),
+            ).fetchone()
+            r_week = conn.execute(
+                "SELECT COUNT(*) AS calls, COALESCE(SUM(total_tokens),0) AS tokens"
+                " FROM llm_usage WHERE provider = ? AND called_at >= datetime('now', '-7 days')",
+                (provider,),
+            ).fetchone()
+            features = conn.execute(
+                "SELECT feature, COUNT(*) AS calls,"
+                " COALESCE(SUM(input_tokens),0) AS input_tokens,"
+                " COALESCE(SUM(output_tokens),0) AS output_tokens,"
+                " COALESCE(SUM(total_tokens),0) AS total_tokens"
+                " FROM llm_usage WHERE provider = ? GROUP BY feature ORDER BY total_tokens DESC",
+                (provider,),
+            ).fetchall()
+        return {
+            "total_calls": r["calls"], "total_tokens": r["tokens"],
+            "today_calls": r_today["calls"], "today_tokens": r_today["tokens"],
+            "week_calls": r_week["calls"], "week_tokens": r_week["tokens"],
+            "by_feature": [dict(f) for f in features],
+        }
+    except Exception:
+        logger.warning("could not read LLM usage stats from %s", db_path, exc_info=True)
+        return empty
+
+
+def _load_ai_features() -> dict:
+    try:
+        from core.ai_config import load as _ai_load
+        return _ai_load()
+    except Exception as exc:
+        logger.warning("_load_ai_features failed: %s", exc)
+        return {}
+
+
+def _list_prompts() -> list[dict]:
+    prompts = []
+    for p in sorted(_PROMPTS_DIR.glob("*.md")):
+        content = p.read_text(encoding="utf-8")
+        first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), "")
+        description = first_line[:100] if first_line else ""
+        prompts.append({"filename": p.name, "description": description, "content": content})
+    return prompts
+
+
+def _read_notification_channels() -> list:
+    """Return NOTIFICATION_CHANNELS, migrating from legacy single-webhook config if needed."""
+    return _normalize_notification_channels(
+        getattr(_config, "NOTIFICATION_CHANNELS", []),
+        legacy_url=getattr(_config, "MATTERMOST_WEBHOOK_URL", ""),
+        legacy_enabled=getattr(_config, "MATTERMOST_ENABLED", False),
+    )
+
+
+def _read() -> dict:
+    importlib.reload(_config)
+    raw_exclusions = getattr(_config, "DAILY_BRIEFING_TITLE_EXCLUSIONS", [])
+    if isinstance(raw_exclusions, str):
+        daily_briefing_title_exclusions = [p.strip() for p in raw_exclusions.splitlines() if p.strip()]
+    else:
+        daily_briefing_title_exclusions = [str(p).strip() for p in (raw_exclusions or []) if str(p).strip()]
+    focus_points_geographies = [str(p).strip() for p in (getattr(_config, "FOCUS_POINTS_GEOGRAPHIES", []) or []) if str(p).strip()]
+    focus_points_sectors = [str(p).strip() for p in (getattr(_config, "FOCUS_POINTS_SECTORS", []) or []) if str(p).strip()]
+    focus_points_technologies = [str(p).strip() for p in (getattr(_config, "FOCUS_POINTS_TECHNOLOGIES", []) or []) if str(p).strip()]
+    focus_points_vendors = [str(p).strip() for p in (getattr(_config, "FOCUS_POINTS_VENDORS", []) or []) if str(p).strip()]
+    focus_points_threat_types = [str(p).strip() for p in (getattr(_config, "FOCUS_POINTS_THREAT_TYPES", []) or []) if str(p).strip()]
+    focus_points_threat_actors = [str(p).strip() for p in (getattr(_config, "FOCUS_POINTS_THREAT_ACTORS", []) or []) if str(p).strip()]
+    raw_tat = getattr(_config, "THREAT_ACTOR_TYPES", []) or []
+    threat_actor_types = [
+        {"name": str(t.get("name", "")).strip(), "description": str(t.get("description", "")).strip()}
+        for t in raw_tat if isinstance(t, dict)
+    ]
+    tag_strip_prefixes = [str(p).strip() for p in (getattr(_config, "COLLECTION_TAG_STRIP_PREFIXES", []) or []) if str(p).strip()]
+    tag_hide_prefixes = [str(p).strip() for p in (getattr(_config, "COLLECTION_TAG_HIDE_PREFIXES", []) or []) if str(p).strip()]
+    openai_api_key = getattr(_config, "OPENAI_API_KEY", getattr(_config, "ANTHROPIC_API_KEY", ""))
+    openai_model = getattr(_config, "OPENAI_MODEL", getattr(_config, "ANTHROPIC_MODEL", ""))
+    return {
+        "MISP_URL": _config.MISP_URL,
+        "MISP_KEY": _config.MISP_KEY,
+        "MISP_VERIFYCERT": _config.MISP_VERIFYCERT,
+        "MISP_WEBAPP_URL": _config.MISP_WEBAPP_URL,
+        "MISP_WEBAPP_KEY": _config.MISP_WEBAPP_KEY,
+        "MISP_WEBAPP_VERIFYCERT": _config.MISP_WEBAPP_VERIFYCERT,
+        "MISP_EVENT_DISTRIBUTION": getattr(_config, "MISP_EVENT_DISTRIBUTION", 0),
+        "OPENAI_API_KEY": openai_api_key,
+        "OPENAI_MODEL": openai_model,
+        "OPENAI_ENABLED": bool(getattr(_config, "OPENAI_ENABLED", True)),
+        "LOCAL_LLM_ENABLED": bool(getattr(_config, "LOCAL_LLM_ENABLED", False)),
+        "LOCAL_LLM_URL": getattr(_config, "LOCAL_LLM_URL", ""),
+        "LOCAL_LLM_API_KEY": getattr(_config, "LOCAL_LLM_API_KEY", ""),
+        "LOCAL_LLM_MODEL": getattr(_config, "LOCAL_LLM_MODEL", ""),
+        "LLM_DEFAULT_PROVIDER": getattr(_config, "LLM_DEFAULT_PROVIDER", "openai"),
+        **ai_connector.settings(),
+        "NOTIFICATION_CHANNELS": _read_notification_channels(),
+        "SMTP_HOST": getattr(_config, "SMTP_HOST", ""),
+        "SMTP_PORT": getattr(_config, "SMTP_PORT", 587),
+        "SMTP_USE_TLS": getattr(_config, "SMTP_USE_TLS", True),
+        "SMTP_USERNAME": getattr(_config, "SMTP_USERNAME", ""),
+        "SMTP_PASSWORD": getattr(_config, "SMTP_PASSWORD", ""),
+        "SMTP_FROM": getattr(_config, "SMTP_FROM", ""),
+        "SMTP_SENDER_NAME": getattr(_config, "SMTP_SENDER_NAME", ""),
+        "FLOWINTEL_INSTANCES": getattr(_config, "FLOWINTEL_INSTANCES", []),
+        "FLOWINTEL_CASE_TEMPLATE_PRODUCTS": FLOWINTEL_CASE_TEMPLATE_PRODUCTS,
+        "RULEZET_ENABLED": getattr(_config, "RULEZET_ENABLED", True),
+        "RULEZET_URL": getattr(_config, "RULEZET_URL", ""),
+        "MISP_SERVERS": getattr(_config, "MISP_SERVERS", []),
+        "IMAP_SOURCES": getattr(_config, "IMAP_SOURCES", []),
+        "PRODUCT_TYPES": _config.PRODUCT_TYPES,
+        "DAILY_BRIEFING_TITLE_EXCLUSIONS": daily_briefing_title_exclusions,
+        "FOCUS_POINTS_GEOGRAPHIES": focus_points_geographies,
+        "FOCUS_POINTS_SECTORS": focus_points_sectors,
+        "FOCUS_POINTS_TECHNOLOGIES": focus_points_technologies,
+        "FOCUS_POINTS_VENDORS": focus_points_vendors,
+        "FOCUS_POINTS_THREAT_TYPES": focus_points_threat_types,
+        "FOCUS_POINTS_THREAT_ACTORS": focus_points_threat_actors,
+        "THREAT_ACTOR_TYPES": threat_actor_types,
+        "ASSET_INVENTORY_ENABLED": getattr(_config, "ASSET_INVENTORY_ENABLED", False),
+        "ASSET_INVENTORY_FILE": getattr(_config, "ASSET_INVENTORY_FILE", "data/assets.csv"),
+        "ASSET_INVENTORY_REFRESH_MINUTES": getattr(_config, "ASSET_INVENTORY_REFRESH_MINUTES", 60),
+        "COLLECTION_TAG_STRIP_PREFIXES": tag_strip_prefixes,
+        "COLLECTION_TAG_HIDE_PREFIXES": tag_hide_prefixes,
+        "TAG_STAKEHOLDER": _config.TAG_STAKEHOLDER,
+        "TAG_PIR": _config.TAG_PIR,
+        "TAG_GIR": _config.TAG_GIR,
+        "TAG_RFI": _config.TAG_RFI,
+        "TAG_FLASH_INTEL": _config.TAG_FLASH_INTEL,
+        "TAG_VEA": _config.TAG_VEA,
+        "TAG_BRIEFING": _config.TAG_BRIEFING,
+        "TAG_TLR": getattr(_config, "TAG_TLR", 'zsazsa:ctiproduct="threat-landscape-report"'),
+        "TAG_THREAT_ACTOR_PROFILE": getattr(_config, "TAG_THREAT_ACTOR_PROFILE",
+                                            'zsazsa:ctiproduct="threat-actor-profile"'),
+        "TAG_INDICATOR_FEED": getattr(_config, "TAG_INDICATOR_FEED",
+                                      'zsazsa:ctiproduct="indicator-feed"'),
+        "TAG_DETECTION_ENG": getattr(_config, "TAG_DETECTION_ENG",
+                                     'zsazsa:ctiproduct="detection-eng-request"'),
+        "TAG_COLLECTION_FOLLOWUP": getattr(_config, "TAG_COLLECTION_FOLLOWUP", 'zsazsa:collection="follow-up"'),
+        "TAG_COLLECTION_DISMISSED": getattr(_config, "TAG_COLLECTION_DISMISSED", 'zsazsa:event="dismiss"'),
+        "RECOMMENDED_ACTIONS_IMMEDIATE": getattr(_config, "RECOMMENDED_ACTIONS_IMMEDIATE", []),
+        "RECOMMENDED_ACTIONS_NEAR_TERM": getattr(_config, "RECOMMENDED_ACTIONS_NEAR_TERM", []),
+        "ANALYSER_FLASH_INTEL": getattr(_config, "ANALYSER_FLASH_INTEL", True),
+        "ANALYSER_VULNERABILITY_ADVISORIES": getattr(_config, "ANALYSER_VULNERABILITY_ADVISORIES", False),
+        "ANALYSER_DAILY_BRIEFING": getattr(_config, "ANALYSER_DAILY_BRIEFING", False),
+        "ANALYSER_DAILY_BRIEFING_HOUR": getattr(_config, "ANALYSER_DAILY_BRIEFING_HOUR", 21),
+        **{setting.key: analyser_settings.get(setting.key) for setting in analyser_settings.ALL},
+        "MISP_SCRAPER_ENABLED": getattr(_config, "MISP_SCRAPER_ENABLED", True),
+        "SCRAPER_MARKER_TAG": _config.SCRAPER_MARKER_TAG,
+        "MISP_SCRAPER_LIMIT": getattr(_config, "MISP_SCRAPER_LIMIT", 500),
+        "MISP_SCRAPER_SINCE_DAYS": getattr(_config, "MISP_SCRAPER_SINCE_DAYS", 30),
+        "SCRAPER_REDIS_HOST": getattr(_config, "SCRAPER_REDIS_HOST", "127.0.0.1"),
+        "SCRAPER_REDIS_PORT": getattr(_config, "SCRAPER_REDIS_PORT", 6379),
+        "SCRAPER_REDIS_PASSWORD": getattr(_config, "SCRAPER_REDIS_PASSWORD", ""),
+        "SCRAPER_REDIS_CHANNEL": getattr(_config, "SCRAPER_REDIS_CHANNEL", "urls"),
+        "JOB_REDIS_HOST": getattr(_config, "JOB_REDIS_HOST", "127.0.0.1"),
+        "JOB_REDIS_PORT": getattr(_config, "JOB_REDIS_PORT", 6379),
+        "JOB_REDIS_DB": getattr(_config, "JOB_REDIS_DB", 0),
+        "JOB_REDIS_USERNAME": getattr(_config, "JOB_REDIS_USERNAME", ""),
+        "JOB_REDIS_PASSWORD": getattr(_config, "JOB_REDIS_PASSWORD", ""),
+        "JOB_REDIS_KEY": getattr(_config, "JOB_REDIS_KEY", "zsazsa:jobs"),
+        "EVENT_LOG_RETENTION_DAYS": getattr(_config, "EVENT_LOG_RETENTION_DAYS", 90),
+        "PIPELINE_RUN_LOG_RETENTION_DAYS": getattr(_config, "PIPELINE_RUN_LOG_RETENTION_DAYS", 90),
+        "AUDIT_LOG_RETENTION_DAYS": getattr(_config, "AUDIT_LOG_RETENTION_DAYS", 365),
+        "LOG_LEVEL": _config.LOG_LEVEL,
+        "HOSTNAME": getattr(_config, "HOSTNAME", "0.0.0.0"),
+        "PORT": getattr(_config, "PORT", 5000),
+        "SSL_ENABLED": getattr(_config, "SSL_ENABLED", False),
+        "SSL_CERT": getattr(_config, "SSL_CERT", "certs/zsazsa.crt"),
+        "SSL_KEY": getattr(_config, "SSL_KEY", "certs/zsazsa.key"),
+        "MISP_SESSION_COOKIE_NAME": getattr(_config, "MISP_SESSION_COOKIE_NAME", ""),
+        "MISP_SESSION_REDIS_HOST": getattr(_config, "MISP_SESSION_REDIS_HOST", "127.0.0.1"),
+        "MISP_SESSION_REDIS_PORT": getattr(_config, "MISP_SESSION_REDIS_PORT", 6379),
+        "MISP_SESSION_REDIS_DB": getattr(_config, "MISP_SESSION_REDIS_DB", 0),
+        "MISP_SESSION_REDIS_USERNAME": getattr(_config, "MISP_SESSION_REDIS_USERNAME", ""),
+        "MISP_SESSION_REDIS_PASSWORD": getattr(_config, "MISP_SESSION_REDIS_PASSWORD", ""),
+        "MISP_SESSION_REDIRECT_TO_LOGIN": getattr(_config, "MISP_SESSION_REDIRECT_TO_LOGIN", False),
+        "prompts": _list_prompts(),
+        "llm_usage": _llm_usage_stats("openai"),
+        "llm_usage_local": _llm_usage_stats("local"),
+        "ai_features": _load_ai_features(),
+        "BRAND_COMPANY": getattr(_config, "BRAND_COMPANY", ""),
+        "BRAND_DEPARTMENT": getattr(_config, "BRAND_DEPARTMENT", ""),
+        "BRAND_COLOR_1": getattr(_config, "BRAND_COLOR_1", "#0f2d52"),
+        "BRAND_COLOR_2": getattr(_config, "BRAND_COLOR_2", "#0078f1"),
+        "BRAND_COLOR_3": getattr(_config, "BRAND_COLOR_3", "#64748b"),
+        "BRAND_LOGO": getattr(_config, "BRAND_LOGO", ""),
+        "THEME": getattr(_config, "THEME", "overmind"),
+    }
+
+
+def _form_tag(name: str) -> str:
+    """A tag field, falling back to what is configured rather than to nothing.
+
+    Every one of these marks a product or an entity type in MISP, so an empty
+    one detaches everything carrying it. A form posted without the field, an
+    older page left open across an upgrade, looks exactly like one where it was
+    cleared, and neither should wipe the tag.
+    """
+    return request.form.get(name, "").strip() or getattr(_config, name, "")
+
+
+def _form_str(name: str) -> str:
+    """A text field, keeping what is configured when the form did not send it.
+
+    Clearing a field on purpose still clears it: an empty value that was posted
+    is a decision, an absent one is not. That distinction is what stops a page
+    submitted without a field, from an older version or a tab whose inputs
+    never rendered, wiping a MISP key or an SMTP password.
+    """
+    raw = request.form.get(name)
+    return raw.strip() if raw is not None else str(getattr(_config, name, "") or "")
+
+
+def _form_bool(name: str, default: bool = False) -> bool:
+    """A checkbox, keeping what is configured when the form did not send it.
+
+    The stakes are one-sided here: an absent field reading as False turns off
+    TLS verification, SMTP encryption or the login redirect without anyone
+    asking for it. A browser sends nothing for an unticked box, so each one is
+    followed by a hidden field of the same name holding "false": a ticked box
+    comes first in the form and wins.
+    """
+    raw = request.form.get(name)
+    return raw == "true" if raw is not None else bool(getattr(_config, name, default))
+
+
+def _form_lines(name: str) -> list | None:
+    """One value per line, or None when the form did not send the field.
+
+    None rather than an empty list, so the caller can tell "the analyst emptied
+    the box" from "the box was never there" and keep the configured list.
+    """
+    raw = request.form.get(name)
+    if raw is None:
+        return None
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def _form_int(name: str, default: int) -> int:
+    """A number from the form, falling back the same way _form_tag does.
+
+    A field the form never sent keeps whatever is configured: resetting a port
+    or a Redis database number to a built-in default is as damaging as blanking
+    a tag. A field that was sent but holds nothing usable takes the default,
+    and never raises, since these are built before the save is even attempted.
+    """
+    raw = request.form.get(name)
+    if raw is None:
+        configured = getattr(_config, name, default)
+        return configured if isinstance(configured, int) else default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+# Secrets are write-only: the settings pages never send a stored one back to
+# the browser. A secret field posted empty therefore means "keep what is
+# stored", and the stored secret stays with the address it was entered for, so
+# pointing a setting somewhere else never hands it to the new host.
+
+def _same_address(a, b) -> bool:
+    return (a or "").strip().rstrip("/") == (b or "").strip().rstrip("/")
+
+
+def _kept_secret(posted, stored, address, stored_address):
+    """The secret to store: the one posted, else the stored one.
+
+    Emptying the address drops its secret along with it. None when nothing was
+    posted but the address changed to another one: the stored secret belongs to
+    the old address and has to be entered again for the new one.
+    """
+    if posted or not stored:
+        return posted
+    if _same_address(address, stored_address):
+        return stored
+    return None if (address or "").strip() else ""
+
+
+def _stored_secret_for(address, pairs) -> str:
+    """The stored secret entered for ``address``, from (address, secret) pairs.
+
+    Lets a connection test run with the key that is already stored, but only
+    against the address that key was stored for.
+    """
+    if not (address or "").strip():
+        return ""
+    return next((secret for addr, secret in pairs if secret and _same_address(addr, address)), "")
+
+
+def _form_secret(name, address_name):
+    """A secret field of the main form; see _kept_secret. "" when removed."""
+    if request.form.get(f"remove_{name}") == "true":
+        return ""
+    return _kept_secret(
+        (request.form.get(name) or "").strip(),
+        str(getattr(_config, name, "") or ""),
+        _form_str(address_name),
+        str(getattr(_config, address_name, "") or ""),
+    )
+
+
+def _reenter_message(what) -> str:
+    return f"Enter the {what} again: its address changed, and the stored one is only used for the old address."
+
+
+_SMTP_FROM_MISSING = "Enter the From address: no mail goes out through the SMTP host without one."
+
+
+def _write(values):
+    shutil.copy2(str(_CONFIG_FILE), str(_BACKUP_FILE))
+    workflow_lines = "\n".join(f"{setting.key} = {values[setting.key]!r}" for setting in analyser_settings.ALL)
+    products = values["PRODUCT_TYPES"]
+    products_repr = "[\n" + "".join(f"    {p!r},\n" for p in products) + "]"
+    briefing_title_exclusions = values.get("DAILY_BRIEFING_TITLE_EXCLUSIONS", [])
+    briefing_title_exclusions_repr = "[\n" + "".join(f"    {p!r},\n" for p in briefing_title_exclusions) + "]"
+    fp_geographies = values.get("FOCUS_POINTS_GEOGRAPHIES", [])
+    fp_geographies_repr = "[\n" + "".join(f"    {p!r},\n" for p in fp_geographies) + "]"
+    fp_sectors = values.get("FOCUS_POINTS_SECTORS", [])
+    fp_sectors_repr = "[\n" + "".join(f"    {p!r},\n" for p in fp_sectors) + "]"
+    fp_technologies = values.get("FOCUS_POINTS_TECHNOLOGIES", [])
+    fp_technologies_repr = "[\n" + "".join(f"    {p!r},\n" for p in fp_technologies) + "]"
+    fp_vendors = values.get("FOCUS_POINTS_VENDORS", [])
+    fp_vendors_repr = "[\n" + "".join(f"    {p!r},\n" for p in fp_vendors) + "]"
+    fp_threat_types = values.get("FOCUS_POINTS_THREAT_TYPES", [])
+    fp_threat_types_repr = "[\n" + "".join(f"    {p!r},\n" for p in fp_threat_types) + "]"
+    fp_threat_actors = values.get("FOCUS_POINTS_THREAT_ACTORS", [])
+    fp_threat_actors_repr = "[\n" + "".join(f"    {p!r},\n" for p in fp_threat_actors) + "]"
+    tag_strip = values.get("COLLECTION_TAG_STRIP_PREFIXES", [])
+    tag_strip_repr = "[\n" + "".join(f"    {p!r},\n" for p in tag_strip) + "]"
+    tag_hide = values.get("COLLECTION_TAG_HIDE_PREFIXES", [])
+    tag_hide_repr = "[\n" + "".join(f"    {p!r},\n" for p in tag_hide) + "]"
+    tat = values.get("THREAT_ACTOR_TYPES", [])
+    if tat:
+        tat_lines = ["[\n"]
+        for t in tat:
+            tat_lines.append(
+                f"    {{'name': {t.get('name', '')!r}, 'description': {t.get('description', '')!r}}},\n"
+            )
+        tat_lines.append("]")
+        tat_repr = "".join(tat_lines)
+    else:
+        tat_repr = "[]"
+    servers = values.get("MISP_SERVERS", [])
+    if servers:
+        lines = []
+        for s in servers:
+            lines.append("    {")
+            for k in ("id", "label", "url", "api_key", "verify_tls", "enabled", "allow_reports", "analyse",
+                      "tags", "tags_and", "tags_not",
+                      "org_filter_type", "org_filter", "since_days", "limit"):
+                if k in s:
+                    lines.append(f"        {k!r}: {s[k]!r},")
+            lines.append("    },")
+        servers_repr = "[\n" + "\n".join(lines) + "\n]"
+    else:
+        servers_repr = "[]"
+    imap_sources = values.get("IMAP_SOURCES", [])
+    if imap_sources:
+        lines = []
+        for m in imap_sources:
+            lines.append("    {")
+            for k in ("id", "name", "enabled", "host", "port", "ssl",
+                      "username", "password", "folder"):
+                lines.append(f"        {k!r}: {m.get(k)!r},")
+            lines.append("        'sources': [")
+            for s in m.get("sources") or []:
+                lines.append("            {")
+                for k in ("id", "name", "enabled", "parser", "subjects",
+                          "senders", "reliability", "mode"):
+                    lines.append(f"                {k!r}: {s.get(k)!r},")
+                lines.append("            },")
+            lines.append("        ],")
+            lines.append("    },")
+        imap_sources_repr = "[\n" + "\n".join(lines) + "\n]"
+    else:
+        imap_sources_repr = "[]"
+    channels = values.get("NOTIFICATION_CHANNELS", [])
+    if channels:
+        ch_lines = []
+        for c in channels:
+            if (c.get("type") or "").lower() == "email":
+                keys = ("id", "name", "type", "recipient", "enabled")
+            else:
+                keys = ("id", "name", "type", "url", "enabled", "verify_tls")
+            ch_lines.append("    {")
+            for k in keys:
+                ch_lines.append(f"        {k!r}: {c.get(k)!r},")
+            ch_lines.append("    },")
+        channels_repr = "[\n" + "\n".join(ch_lines) + "\n]"
+    else:
+        channels_repr = "[]"
+    flowintel_instances = values.get("FLOWINTEL_INSTANCES", [])
+    if flowintel_instances:
+        fi_lines = []
+        for fi in flowintel_instances:
+            fi_lines.append("    {")
+            for k in ("id", "name", "url", "api_key", "enabled", "verify_tls"):
+                fi_lines.append(f"        {k!r}: {fi.get(k)!r},")
+            case_templates_repr = repr(fi.get("case_templates") or {})
+            fi_lines.append(f"        'case_templates': {case_templates_repr},")
+            fi_lines.append("    },")
+        flowintel_instances_repr = "[\n" + "\n".join(fi_lines) + "\n]"
+    else:
+        flowintel_instances_repr = "[]"
+    ai_connector_lines = "\n".join(f"{name} = {values.get(name, default)!r}"
+                                   for name, default in ai_connector.DEFAULTS.items())
+    content = f"""SECRET_KEY = {_config.SECRET_KEY!r}
+
+# MISP - scraper / analyser pipeline. Optional: set MISP_SCRAPER_ENABLED to
+# False, or leave the URL and key empty, to run without one.
+MISP_SCRAPER_ENABLED = {bool(values['MISP_SCRAPER_ENABLED'])}
+MISP_URL = {values['MISP_URL']!r}
+MISP_KEY = {values['MISP_KEY']!r}
+MISP_VERIFYCERT = {bool(values['MISP_VERIFYCERT'])}
+
+# MISP - webapp (CTI program objects: stakeholders, PIRs, GIRs)
+# Defaults to the same server; override to use a dedicated MISP instance.
+MISP_WEBAPP_URL = {values['MISP_WEBAPP_URL']!r}
+MISP_WEBAPP_KEY = {values['MISP_WEBAPP_KEY']!r}
+MISP_WEBAPP_VERIFYCERT = {bool(values['MISP_WEBAPP_VERIFYCERT'])}
+
+# Distribution level for MISP events the backend creates (stakeholders, PIRs,
+# GIRs, RFIs and products). 0 = your organisation only (default and safest),
+# 1 = this community, 2 = connected communities, 3 = all communities.
+MISP_EVENT_DISTRIBUTION = {int(values.get('MISP_EVENT_DISTRIBUTION') or 0)}
+
+# LLM providers. LLM_DEFAULT_PROVIDER is the provider used by features that do
+# not pick one themselves: 'openai' or 'local'.
+LLM_DEFAULT_PROVIDER = {values.get('LLM_DEFAULT_PROVIDER', 'openai')!r}
+
+# OpenAI
+OPENAI_ENABLED = {bool(values.get('OPENAI_ENABLED', True))}
+OPENAI_API_KEY = {values['OPENAI_API_KEY']!r}
+OPENAI_MODEL = {values['OPENAI_MODEL']!r}
+
+# Local LLM, reachable over an OpenAI-compatible API endpoint.
+LOCAL_LLM_ENABLED = {bool(values.get('LOCAL_LLM_ENABLED', False))}
+LOCAL_LLM_URL = {values.get('LOCAL_LLM_URL', '')!r}
+LOCAL_LLM_API_KEY = {values.get('LOCAL_LLM_API_KEY', '')!r}
+LOCAL_LLM_MODEL = {values.get('LOCAL_LLM_MODEL', '')!r}
+
+# The ai-connector MISP module (https://github.com/cudeso/ai-connector), a
+# misp-modules server, with the same settings as MISP's Plugin.AI_*. It runs
+# its own prompts, so it is not a provider the AI features can choose.
+{ai_connector_lines}
+
+# Notification channels. 'type' is 'mattermost', 'teams' (a Teams Workflows
+# webhook URL) or 'email' (with 'recipient' instead of 'url').
+NOTIFICATION_CHANNELS = {channels_repr}
+
+# Legacy aliases: first active Mattermost channel (used by notifier for fallback)
+MATTERMOST_ENABLED = any(c.get('type') == 'mattermost' and c.get('enabled') for c in NOTIFICATION_CHANNELS)
+MATTERMOST_WEBHOOK_URL = next((c.get('url', '') for c in NOTIFICATION_CHANNELS if c.get('type') == 'mattermost' and c.get('enabled')), '')
+
+# SMTP server settings, shared by all email notification channels.
+SMTP_HOST = {values.get('SMTP_HOST', '')!r}
+SMTP_PORT = {int(values.get('SMTP_PORT') or 587)}
+SMTP_USE_TLS = {bool(values.get('SMTP_USE_TLS', True))}
+SMTP_USERNAME = {values.get('SMTP_USERNAME', '')!r}
+SMTP_PASSWORD = {values.get('SMTP_PASSWORD', '')!r}
+SMTP_FROM = {values.get('SMTP_FROM', '')!r}
+SMTP_SENDER_NAME = {values.get('SMTP_SENDER_NAME', '')!r}
+
+# Flowintel case management instances
+FLOWINTEL_INSTANCES = {flowintel_instances_repr}
+
+# Rulezet instance (https://github.com/ngsoti/rulezet-core) queried for public
+# detection rules by CVE ID or MITRE ATT&CK technique, from the "Search Rulezet"
+# buttons on the Vulnerability advisory, Threat actor profile and Daily briefing
+# forms. It also validates the draft rule of a Detection engineering request:
+# without Rulezet a request cannot be marked Active.
+# RULEZET_ENABLED switches it off without forgetting the address. Point the
+# URL at a local dev instance (e.g. 'http://127.0.0.1:7009') or the public
+# 'https://rulezet.org'.
+RULEZET_ENABLED = {bool(values.get('RULEZET_ENABLED', True))}
+RULEZET_URL = {values.get('RULEZET_URL', '')!r}
+
+# Additional MISP servers queried by the data-collection page.
+MISP_SERVERS = {servers_repr}
+
+# IMAP mailboxes polled by run_imap_collector.py for newsletter e-mails.
+IMAP_SOURCES = {imap_sources_repr}
+
+# Collection sources offered when editing a PIR or GIR.
+# Derived automatically from the MISP scraper and configured MISP servers.
+# Do not set manually; edit the sources above instead.
+def _build_collection_sources():
+    items = []
+    if MISP_SCRAPER_ENABLED and MISP_URL and MISP_KEY:
+        items.append('misp-scraper')
+    for s in MISP_SERVERS:
+        label = (s.get('label') or '').strip()
+        if label and label not in items:
+            items.append(label)
+    return items
+
+COLLECTION_SOURCES = _build_collection_sources()
+
+# Product types used for stakeholder subscriptions and PIR deliverables
+PRODUCT_TYPES = {products_repr}
+
+# Threat actor types (ENISA taxonomy) - reference list available to all CTI products
+THREAT_ACTOR_TYPES = {tat_repr}
+
+# Daily briefing analyser: skip source events/reports whose titles contain
+# any of these substrings (case-insensitive).
+DAILY_BRIEFING_TITLE_EXCLUSIONS = {briefing_title_exclusions_repr}
+
+# Vulnerability advisories: with the asset inventory on, the analyser only makes
+# an advisory for a CVE in a product listed in this CSV file of
+# "Supplier","Product","Version" rows, read again every so many minutes.
+ASSET_INVENTORY_ENABLED = {bool(values.get('ASSET_INVENTORY_ENABLED'))}
+ASSET_INVENTORY_FILE = {values.get('ASSET_INVENTORY_FILE') or 'data/assets.csv'!r}
+ASSET_INVENTORY_REFRESH_MINUTES = {int(values.get('ASSET_INVENTORY_REFRESH_MINUTES') or 60)}
+
+# Organisation-wide focus points used for AI-assisted briefing and relevance logic.
+FOCUS_POINTS_GEOGRAPHIES = {fp_geographies_repr}
+FOCUS_POINTS_SECTORS = {fp_sectors_repr}
+FOCUS_POINTS_VENDORS = {fp_vendors_repr}
+FOCUS_POINTS_TECHNOLOGIES = {fp_technologies_repr}
+FOCUS_POINTS_THREAT_TYPES = {fp_threat_types_repr}
+FOCUS_POINTS_THREAT_ACTORS = {fp_threat_actors_repr}
+
+# MISP context tags - entity type markers (stakeholders, requirements, RFIs)
+TAG_STAKEHOLDER = {values['TAG_STAKEHOLDER']!r}
+TAG_PIR         = {values['TAG_PIR']!r}
+TAG_GIR         = {values['TAG_GIR']!r}
+TAG_RFI         = {values['TAG_RFI']!r}
+
+# MISP context tags - product classification (serve as both type and product marker)
+TAG_FLASH_INTEL = {values['TAG_FLASH_INTEL']!r}
+TAG_VEA         = {values['TAG_VEA']!r}
+TAG_BRIEFING    = {values['TAG_BRIEFING']!r}
+TAG_TLR         = {values['TAG_TLR']!r}
+TAG_INDICATOR_FEED = {values['TAG_INDICATOR_FEED']!r}
+TAG_DETECTION_ENG = {values['TAG_DETECTION_ENG']!r}
+TAG_THREAT_ACTOR_PROFILE = {values['TAG_THREAT_ACTOR_PROFILE']!r}
+TAG_COLLECTION_FOLLOWUP = {values['TAG_COLLECTION_FOLLOWUP']!r}
+TAG_COLLECTION_DISMISSED = {values['TAG_COLLECTION_DISMISSED']!r}
+
+# Data collection tag display settings
+COLLECTION_TAG_STRIP_PREFIXES = {tag_strip_repr}
+COLLECTION_TAG_HIDE_PREFIXES = {tag_hide_repr}
+
+# Recommended actions shown in flash intel and VEA wizards
+RECOMMENDED_ACTIONS_IMMEDIATE = {values.get('RECOMMENDED_ACTIONS_IMMEDIATE', [])!r}
+RECOMMENDED_ACTIONS_NEAR_TERM = {values.get('RECOMMENDED_ACTIONS_NEAR_TERM', [])!r}
+
+# Analyser
+# What each scheduled run makes. The daily briefing is made once a day, by the
+# first run from this hour (UTC) on.
+ANALYSER_FLASH_INTEL = {bool(values.get('ANALYSER_FLASH_INTEL', True))}
+ANALYSER_VULNERABILITY_ADVISORIES = {bool(values.get('ANALYSER_VULNERABILITY_ADVISORIES'))}
+ANALYSER_DAILY_BRIEFING = {bool(values.get('ANALYSER_DAILY_BRIEFING'))}
+ANALYSER_DAILY_BRIEFING_HOUR = {int(values.get('ANALYSER_DAILY_BRIEFING_HOUR', 21))}
+SCRAPER_MARKER_TAG = {values['SCRAPER_MARKER_TAG']!r}
+MISP_SCRAPER_LIMIT = {int(values.get('MISP_SCRAPER_LIMIT') or 500)}
+MISP_SCRAPER_SINCE_DAYS = {int(values.get('MISP_SCRAPER_SINCE_DAYS') or 0)}
+EVENT_LOG_RETENTION_DAYS = {int(values.get('EVENT_LOG_RETENTION_DAYS') or 90)}
+PIPELINE_RUN_LOG_RETENTION_DAYS = {int(values.get('PIPELINE_RUN_LOG_RETENTION_DAYS') or 90)}
+# 0 keeps the audit log for good.
+AUDIT_LOG_RETENTION_DAYS = {int(values.get('AUDIT_LOG_RETENTION_DAYS', 365))}
+
+# The analyser's workflow (analyser.settings has what each one does).
+{workflow_lines}
+
+# Manual sources pushing to the misp-scraper queue (Redis pub/sub the scraper subscribes to)
+SCRAPER_REDIS_HOST = {values.get('SCRAPER_REDIS_HOST', '127.0.0.1')!r}
+SCRAPER_REDIS_PORT = {int(values.get('SCRAPER_REDIS_PORT') or 6379)}
+SCRAPER_REDIS_PASSWORD = {values.get('SCRAPER_REDIS_PASSWORD', '')!r}
+SCRAPER_REDIS_CHANNEL = {values.get('SCRAPER_REDIS_CHANNEL') or 'urls'!r}
+
+# Background-job state (Redis hash shared across browser tabs and page reloads)
+JOB_REDIS_HOST = {values.get('JOB_REDIS_HOST', '127.0.0.1')!r}
+JOB_REDIS_PORT = {int(values.get('JOB_REDIS_PORT') or 6379)}
+JOB_REDIS_DB = {int(values.get('JOB_REDIS_DB') or 0)}
+JOB_REDIS_USERNAME = {values.get('JOB_REDIS_USERNAME', '')!r}
+JOB_REDIS_PASSWORD = {values.get('JOB_REDIS_PASSWORD', '')!r}
+JOB_REDIS_KEY = {values.get('JOB_REDIS_KEY', 'zsazsa:jobs')!r}
+
+# Paths
+STATE_FILE = {_config.STATE_FILE!r}
+DB_FILE = {_config.DB_FILE!r}
+
+# Logging
+LOG_FILE = {_config.LOG_FILE!r}
+LOG_LEVEL = {values['LOG_LEVEL']!r}
+
+# Web server
+HOSTNAME = {values['HOSTNAME']!r}
+PORT = {int(values['PORT'])}
+SSL_ENABLED = {bool(values['SSL_ENABLED'])}
+SSL_CERT = {values['SSL_CERT']!r}
+SSL_KEY = {values['SSL_KEY']!r}
+
+# MISP - shared session SSO. zsazsa runs as a subpath behind MISP and
+# identifies the logged-in user from MISP's own PHP session cookie, read
+# directly from the Redis instance MISP stores its sessions in.
+# MISP names its session cookie 'MISP-<instance uuid>', which is unique per
+# install. Leave MISP_SESSION_COOKIE_NAME empty to derive it automatically from
+# the MISP server's instance UUID; set it explicitly only to override.
+MISP_SESSION_COOKIE_NAME = {values['MISP_SESSION_COOKIE_NAME']!r}
+MISP_SESSION_REDIS_HOST = {values['MISP_SESSION_REDIS_HOST']!r}
+MISP_SESSION_REDIS_PORT = {int(values['MISP_SESSION_REDIS_PORT'])}
+MISP_SESSION_REDIS_DB = {int(values['MISP_SESSION_REDIS_DB'])}
+MISP_SESSION_REDIS_USERNAME = {values['MISP_SESSION_REDIS_USERNAME']!r}
+MISP_SESSION_REDIS_PASSWORD = {values['MISP_SESSION_REDIS_PASSWORD']!r}
+# If True, visitors without a valid MISP session are redirected to MISP's
+# login page. If False, they fall back to the admin@admin.test identity.
+MISP_SESSION_REDIRECT_TO_LOGIN = {bool(values['MISP_SESSION_REDIRECT_TO_LOGIN'])}
+
+# Branding (used for PDF outputs and channel notifications)
+BRAND_COMPANY    = {values.get('BRAND_COMPANY', '')!r}
+BRAND_DEPARTMENT = {values.get('BRAND_DEPARTMENT', '')!r}
+BRAND_COLOR_1    = {values.get('BRAND_COLOR_1', '#0f2d52')!r}
+BRAND_COLOR_2    = {values.get('BRAND_COLOR_2', '#0078f1')!r}
+BRAND_COLOR_3    = {values.get('BRAND_COLOR_3', '#64748b')!r}
+BRAND_LOGO       = {values.get('BRAND_LOGO', '')!r}
+
+# UI theme: 'overmind' (MISP Overmind teal, default), 'uibeta' (MISP UiBeta-style
+# light) or 'default' (zsazsa legacy navy)
+THEME = {values.get('THEME', 'overmind')!r}
+"""
+    # A half-written config module is an application that will not start.
+    write_atomically(_CONFIG_FILE, content)
+
+
+def _focus_point_choices() -> tuple[dict, dict]:
+    """The names each focus point list can be picked from, by its galaxy, and
+    the names in each list that its galaxy does not have, by setting. A list
+    whose galaxy cannot be read has neither, rather than every name marked."""
+    try:
+        choices = {
+            "FOCUS_POINTS_GEOGRAPHIES": misp_store.galaxy_geography(),
+            "FOCUS_POINTS_SECTORS": misp_store.galaxy_sectors(),
+            "FOCUS_POINTS_THREAT_ACTORS": misp_store.galaxy_threat_actors(),
+            # A threat type is matched by the technique's name, without its id.
+            "FOCUS_POINTS_THREAT_TYPES": sorted({value.rpartition(" - ")[0] or value
+                                                 for value in misp_store.galaxy_mitre_attack_patterns()}),
+        }
+        missing = {}
+        for point in relevance.focus_points(synonyms=False):
+            if not point["found"] and choices.get(point["setting"]):
+                missing.setdefault(point["setting"], []).append(point["name"])
+    except Exception as exc:
+        logger.warning("Could not read the galaxies of the focus points: %s", exc)
+        return {}, {}
+    return choices, missing
+
+
+_CONFIG_TABS = (
+    "tab-connections", "tab-products", "tab-analyser", "tab-system", "tab-prompts",
+    "tab-ai", "tab-context", "tab-notifications", "tab-styling",
+)
+
+
+@bp.before_request
+def _site_admins_only():
+    # The brand logo is the one thing here that is not a setting.
+    if request.endpoint == "config_page.serve_logo":
+        return None
+    return misp_session.refuse_unless_site_admin()
+
+
+@bp.after_request
+def _no_store(response):
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@bp.route("/config", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        # Each of these keeps its configured value when the form did not carry
+        # the field at all; see _form_lines.
+        def lines(name):
+            posted = _form_lines(name)
+            return posted if posted is not None else list(getattr(_config, name, []) or [])
+
+        products = lines("PRODUCT_TYPES")
+        exclusions = lines("DAILY_BRIEFING_TITLE_EXCLUSIONS")
+        fp_geographies = lines("FOCUS_POINTS_GEOGRAPHIES")
+        fp_sectors = lines("FOCUS_POINTS_SECTORS")
+        fp_technologies = lines("FOCUS_POINTS_TECHNOLOGIES")
+        fp_vendors = lines("FOCUS_POINTS_VENDORS")
+        fp_threat_types = lines("FOCUS_POINTS_THREAT_TYPES")
+        fp_threat_actors = lines("FOCUS_POINTS_THREAT_ACTORS")
+        tat_posted = request.form.get("THREAT_ACTOR_TYPES")
+        if tat_posted is None:
+            threat_actor_types = list(getattr(_config, "THREAT_ACTOR_TYPES", []) or [])
+        else:
+            try:
+                tat_raw = json.loads(tat_posted or "[]")
+                threat_actor_types = [
+                    {"name": str(t.get("name", "")).strip(), "description": str(t.get("description", "")).strip()}
+                    for t in tat_raw if isinstance(t, dict)
+                    if str(t.get("name", "")).strip() or str(t.get("description", "")).strip()
+                ]
+            except (json.JSONDecodeError, ValueError):
+                threat_actor_types = []
+        tag_strip_prefixes = lines("COLLECTION_TAG_STRIP_PREFIXES")
+        tag_hide_prefixes = lines("COLLECTION_TAG_HIDE_PREFIXES")
+        # When single sign-on is enabled, derive the MISP session cookie name from
+        # the connected MISP server (it is 'MISP-<instance uuid>', unique per install)
+        # and store it. Keep the existing value if derivation fails.
+        sso_enabled = _form_bool("MISP_SESSION_REDIRECT_TO_LOGIN")
+        session_cookie_name = getattr(_config, "MISP_SESSION_COOKIE_NAME", "")
+        cookie_autodetected = False
+        if sso_enabled:
+            derived = misp_session.derive_cookie_name()
+            if derived and derived != session_cookie_name:
+                session_cookie_name = derived
+                cookie_autodetected = True
+        values = {
+            "MISP_SCRAPER_ENABLED": bool(getattr(_config, "MISP_SCRAPER_ENABLED", True)),
+            "MISP_URL": getattr(_config, "MISP_URL", ""),
+            "MISP_KEY": getattr(_config, "MISP_KEY", ""),
+            "MISP_VERIFYCERT": getattr(_config, "MISP_VERIFYCERT", True),
+            "MISP_SCRAPER_LIMIT": getattr(_config, "MISP_SCRAPER_LIMIT", 500),
+            "MISP_SCRAPER_SINCE_DAYS": getattr(_config, "MISP_SCRAPER_SINCE_DAYS", 30),
+            "MISP_SERVERS": getattr(_config, "MISP_SERVERS", []) or [],
+            "IMAP_SOURCES": getattr(_config, "IMAP_SOURCES", []) or [],
+            # Every link into MISP appends a path starting with a slash.
+            "MISP_WEBAPP_URL": _form_str("MISP_WEBAPP_URL").rstrip("/"),
+            "MISP_WEBAPP_KEY": _form_secret("MISP_WEBAPP_KEY", "MISP_WEBAPP_URL"),
+            "MISP_WEBAPP_VERIFYCERT": _form_bool("MISP_WEBAPP_VERIFYCERT"),
+            "MISP_EVENT_DISTRIBUTION": _form_int("MISP_EVENT_DISTRIBUTION", 0),
+            # LLM provider settings live on the AI tab and are saved over AJAX.
+            "OPENAI_API_KEY": getattr(_config, "OPENAI_API_KEY", getattr(_config, "ANTHROPIC_API_KEY", "")),
+            "OPENAI_MODEL": getattr(_config, "OPENAI_MODEL", getattr(_config, "ANTHROPIC_MODEL", "")),
+            "OPENAI_ENABLED": bool(getattr(_config, "OPENAI_ENABLED", True)),
+            "LOCAL_LLM_ENABLED": bool(getattr(_config, "LOCAL_LLM_ENABLED", False)),
+            "LOCAL_LLM_URL": getattr(_config, "LOCAL_LLM_URL", ""),
+            "LOCAL_LLM_API_KEY": getattr(_config, "LOCAL_LLM_API_KEY", ""),
+            "LOCAL_LLM_MODEL": getattr(_config, "LOCAL_LLM_MODEL", ""),
+            "LLM_DEFAULT_PROVIDER": getattr(_config, "LLM_DEFAULT_PROVIDER", "openai"),
+            **ai_connector.settings(),
+            "NOTIFICATION_CHANNELS": _read_notification_channels(),
+            # The scraper queue is configured under Collection sources. Carried
+            # through here because the file is rewritten whole: left out, each
+            # save of this page would reset them to the defaults below.
+            "SCRAPER_REDIS_HOST": getattr(_config, "SCRAPER_REDIS_HOST", "127.0.0.1"),
+            "SCRAPER_REDIS_PORT": getattr(_config, "SCRAPER_REDIS_PORT", 6379),
+            "SCRAPER_REDIS_PASSWORD": getattr(_config, "SCRAPER_REDIS_PASSWORD", ""),
+            "SCRAPER_REDIS_CHANNEL": getattr(_config, "SCRAPER_REDIS_CHANNEL", "urls"),
+            "JOB_REDIS_HOST": getattr(_config, "JOB_REDIS_HOST", "127.0.0.1"),
+            "JOB_REDIS_PORT": getattr(_config, "JOB_REDIS_PORT", 6379),
+            "JOB_REDIS_DB": getattr(_config, "JOB_REDIS_DB", 0),
+            "JOB_REDIS_USERNAME": getattr(_config, "JOB_REDIS_USERNAME", ""),
+            "JOB_REDIS_PASSWORD": getattr(_config, "JOB_REDIS_PASSWORD", ""),
+            "JOB_REDIS_KEY": getattr(_config, "JOB_REDIS_KEY", "zsazsa:jobs"),
+            "SMTP_HOST": _form_str("SMTP_HOST"),
+            "SMTP_PORT": _form_int("SMTP_PORT", 587),
+            "SMTP_USE_TLS": _form_bool("SMTP_USE_TLS"),
+            "SMTP_USERNAME": _form_str("SMTP_USERNAME"),
+            "SMTP_PASSWORD": _form_secret("SMTP_PASSWORD", "SMTP_HOST"),
+            "SMTP_FROM": _form_str("SMTP_FROM"),
+            "SMTP_SENDER_NAME": _form_str("SMTP_SENDER_NAME"),
+            "FLOWINTEL_INSTANCES": getattr(_config, "FLOWINTEL_INSTANCES", []),
+            "RULEZET_ENABLED": _form_bool("RULEZET_ENABLED", default=True),
+            "RULEZET_URL": _form_str("RULEZET_URL"),
+            "PRODUCT_TYPES": products,
+            "DAILY_BRIEFING_TITLE_EXCLUSIONS": exclusions,
+            "FOCUS_POINTS_GEOGRAPHIES": fp_geographies,
+            "FOCUS_POINTS_SECTORS": fp_sectors,
+            "FOCUS_POINTS_TECHNOLOGIES": fp_technologies,
+            "FOCUS_POINTS_VENDORS": fp_vendors,
+            "FOCUS_POINTS_THREAT_TYPES": fp_threat_types,
+            "FOCUS_POINTS_THREAT_ACTORS": fp_threat_actors,
+            "THREAT_ACTOR_TYPES": threat_actor_types,
+            "ASSET_INVENTORY_ENABLED": _form_bool("ASSET_INVENTORY_ENABLED"),
+            "ASSET_INVENTORY_FILE": _form_str("ASSET_INVENTORY_FILE") or "data/assets.csv",
+            "ASSET_INVENTORY_REFRESH_MINUTES": max(1, _form_int("ASSET_INVENTORY_REFRESH_MINUTES", 60)),
+            "COLLECTION_TAG_STRIP_PREFIXES": tag_strip_prefixes,
+            "COLLECTION_TAG_HIDE_PREFIXES": tag_hide_prefixes,
+            "TAG_STAKEHOLDER": _form_tag("TAG_STAKEHOLDER"),
+            "TAG_PIR": _form_tag("TAG_PIR"),
+            "TAG_GIR": _form_tag("TAG_GIR"),
+            "TAG_RFI": _form_tag("TAG_RFI"),
+            "TAG_FLASH_INTEL": _form_tag("TAG_FLASH_INTEL"),
+            "TAG_VEA": _form_tag("TAG_VEA"),
+            "TAG_BRIEFING": _form_tag("TAG_BRIEFING"),
+            "TAG_TLR": _form_tag("TAG_TLR"),
+            "TAG_THREAT_ACTOR_PROFILE": _form_tag("TAG_THREAT_ACTOR_PROFILE"),
+            "TAG_INDICATOR_FEED": _form_tag("TAG_INDICATOR_FEED"),
+            "TAG_DETECTION_ENG": _form_tag("TAG_DETECTION_ENG"),
+            "TAG_COLLECTION_FOLLOWUP": _form_tag("TAG_COLLECTION_FOLLOWUP"),
+            "TAG_COLLECTION_DISMISSED": _form_tag("TAG_COLLECTION_DISMISSED"),
+            "RECOMMENDED_ACTIONS_IMMEDIATE": lines("RECOMMENDED_ACTIONS_IMMEDIATE"),
+            "RECOMMENDED_ACTIONS_NEAR_TERM": lines("RECOMMENDED_ACTIONS_NEAR_TERM"),
+            "ANALYSER_FLASH_INTEL": _form_bool("ANALYSER_FLASH_INTEL", default=True),
+            "ANALYSER_VULNERABILITY_ADVISORIES": _form_bool("ANALYSER_VULNERABILITY_ADVISORIES"),
+            "ANALYSER_DAILY_BRIEFING": _form_bool("ANALYSER_DAILY_BRIEFING"),
+            "ANALYSER_DAILY_BRIEFING_HOUR": min(23, max(0, _form_int("ANALYSER_DAILY_BRIEFING_HOUR", 21))),
+            **{setting.key: analyser_settings.parse(setting, request.form.get(setting.key))
+               for setting in analyser_settings.ALL},
+            "SCRAPER_MARKER_TAG": _form_tag("SCRAPER_MARKER_TAG"),
+            "EVENT_LOG_RETENTION_DAYS": max(1, _form_int("EVENT_LOG_RETENTION_DAYS", 90)),
+            "PIPELINE_RUN_LOG_RETENTION_DAYS": max(1, _form_int("PIPELINE_RUN_LOG_RETENTION_DAYS", 90)),
+            "AUDIT_LOG_RETENTION_DAYS": max(0, _form_int("AUDIT_LOG_RETENTION_DAYS", 365)),
+            "LOG_LEVEL": _form_str("LOG_LEVEL") or "INFO",
+            "HOSTNAME": _form_str("HOSTNAME") or "0.0.0.0",
+            "PORT": _form_int("PORT", 5000),
+            "SSL_ENABLED": _form_bool("SSL_ENABLED"),
+            "SSL_CERT": _form_str("SSL_CERT") or "certs/zsazsa.crt",
+            "SSL_KEY": _form_str("SSL_KEY") or "certs/zsazsa.key",
+            "MISP_SESSION_COOKIE_NAME": session_cookie_name,
+            # Where identities are read from is set in the config file only.
+            "MISP_SESSION_REDIS_HOST": getattr(_config, "MISP_SESSION_REDIS_HOST", "127.0.0.1"),
+            "MISP_SESSION_REDIS_PORT": getattr(_config, "MISP_SESSION_REDIS_PORT", 6379),
+            "MISP_SESSION_REDIS_DB": getattr(_config, "MISP_SESSION_REDIS_DB", 0),
+            "MISP_SESSION_REDIS_USERNAME": getattr(_config, "MISP_SESSION_REDIS_USERNAME", ""),
+            "MISP_SESSION_REDIS_PASSWORD": getattr(_config, "MISP_SESSION_REDIS_PASSWORD", ""),
+            "MISP_SESSION_REDIRECT_TO_LOGIN": _form_bool("MISP_SESSION_REDIRECT_TO_LOGIN"),
+            "BRAND_COMPANY": _form_str("BRAND_COMPANY"),
+            "BRAND_DEPARTMENT": _form_str("BRAND_DEPARTMENT"),
+            "BRAND_COLOR_1": _form_str("BRAND_COLOR_1") or "#0f2d52",
+            "BRAND_COLOR_2": _form_str("BRAND_COLOR_2") or "#0078f1",
+            "BRAND_COLOR_3": _form_str("BRAND_COLOR_3") or "#64748b",
+            "BRAND_LOGO": getattr(_config, "BRAND_LOGO", ""),
+            "THEME": _form_str("THEME") or "overmind",
+        }
+        if values["THEME"] not in ("default", "uibeta", "overmind"):
+            values["THEME"] = "overmind"
+        active_tab = request.form.get("active_tab", "tab-connections")
+        if active_tab not in _CONFIG_TABS:
+            active_tab = "tab-connections"
+        # A step of the setup wizard posts here too: saved, it goes on to the
+        # next step; refused, it stays where it was.
+        back = refused = url_for("config_page.index", tab=active_tab)
+        wizard_step = request.form.get("wizard_step")
+        if wizard_step in setup_wizard.STEP_NAMES:
+            refused = url_for("setup_wizard.step", name=wizard_step)
+            back = url_for("setup_wizard.step", name=setup_wizard.next_step(wizard_step))
+        for key, what in (("MISP_WEBAPP_KEY", "MISP API key"), ("SMTP_PASSWORD", "SMTP password")):
+            if values[key] is None:
+                flash(_reenter_message(what), "warning")
+                return redirect(refused)
+        # Only the setup wizard posts the SMTP settings here: the Notifications
+        # tab saves them with their own button.
+        if "SMTP_FROM" in request.form and values["SMTP_HOST"] and not values["SMTP_FROM"]:
+            flash(_SMTP_FROM_MISSING, "warning")
+            return redirect(refused)
+        # Only the settings form posts them: a stored conflict does not hold
+        # up the saves made elsewhere on the page.
+        conflict = analyser_settings.conflict(values) if "ANALYSER_PULL" in request.form else ""
+        if conflict:
+            flash(conflict, "warning")
+            return redirect(refused)
+        try:
+            _write(values)
+            importlib.reload(_config)
+            audit.record("update", "config", details="full configuration saved")
+            flash("Configuration saved. A backup was written to config/__init__.py.backup.", "success")
+            if cookie_autodetected:
+                flash(f"Single sign-on enabled: detected MISP session cookie '{session_cookie_name}' and stored it.", "info")
+            elif sso_enabled and not session_cookie_name:
+                flash("Single sign-on is enabled but the MISP session cookie name could not be detected. Check the MISP connection on the Connections tab.", "warning")
+        except Exception:
+            logger.exception("config save failed")
+            audit.record("update", "config", details="save failed")
+            flash("Could not save configuration.", "warning")
+            return redirect(refused)
+        return redirect(back)
+
+    cfg = _read()
+    active_tab = request.args.get("tab", "tab-connections")
+    if active_tab not in _CONFIG_TABS:
+        active_tab = "tab-connections"
+    key_shortcomings = (misp_store.webapp_key_shortcomings()
+                        if cfg["MISP_WEBAPP_URL"] and cfg["MISP_WEBAPP_KEY"] else None)
+    # Read here rather than from the cache, so a file just put in place shows.
+    try:
+        asset_count, asset_error = len(asset_inventory.read(cfg["ASSET_INVENTORY_FILE"])), ""
+    except asset_inventory.InventoryError as exc:
+        asset_count, asset_error = 0, str(exc)
+    focus_choices, focus_missing = _focus_point_choices()
+    return render_template("config_page.html", cfg=cfg, active_tab=active_tab, migrations=MIGRATIONS,
+                           key_shortcomings=key_shortcomings, asset_count=asset_count, asset_error=asset_error,
+                           analyser_settings=analyser_settings, focus_choices=focus_choices,
+                           focus_missing=focus_missing, focus_lists=setup_wizard.FOCUS_LISTS)
+
+
+def _add_focus_point(category, name):
+    """Add ``name`` to the focus points of a requirement's scope category.
+    Returns the message for the analyst and the HTTP status that goes with it."""
+    setting = FOCUS_POINT_SETTINGS.get(category)
+    if not setting or not name:
+        return "Only a geography, sector, threat actor, threat type, technology or vendor can be a focus point.", 400
+    current = _read()
+    if name.lower() in (n.lower() for n in current[setting]):
+        return f"{name} is already a focus point.", 200
+    current[setting] = current[setting] + [name]
+    try:
+        _write(current)
+        importlib.reload(_config)
+    except Exception:
+        logger.exception("Could not add the focus point %s", name)
+        return "Could not save configuration.", 500
+    audit.record("update", "config", entity_label="focus-points", details=f"{setting}: added {name}")
+    return f"{name} is now a focus point.", 200
+
+
+@bp.route("/config/focus-points/add", methods=["POST"])
+def add_focus_point():
+    """Add a scope item of a PIR or GIR to the focus points, from the overlap in
+    its Scope card. The record's page posts a form and goes back to the record
+    with the overlap open. The edit form posts JSON and stays, so what the
+    analyst has not saved yet is kept."""
+    if request.is_json:
+        data, err = _json_object()
+        if err:
+            return err
+        message, status = _add_focus_point(str(data.get("category") or ""), str(data.get("value") or "").strip())
+        return jsonify({"ok": status == 200, "message": message}), status
+    message, status = _add_focus_point(request.form.get("category", ""), request.form.get("value", "").strip())
+    flash(message, "success" if status == 200 else "warning")
+    kind = request.form.get("kind")
+    record_id = request.form.get("id", "")
+    if kind in ("pir", "gir") and record_id.replace("-", "").isalnum():
+        return redirect(url_for(f"requirements.{kind}_detail", id=record_id, overlap=1, _anchor="scope-overlap"))
+    return redirect(url_for("config_page.index", tab="tab-products", _anchor="products-focus"))
+
+
+@bp.route("/config/run-migration", methods=["POST"])
+@rate_limited("config_run_migration", limit=10, window_s=60)
+def run_migration():
+    """Run a registered maintenance migration script and return its output."""
+    data, err = _json_object()
+    if err:
+        return err
+    migration = _MIGRATIONS_BY_ID.get((data.get("id") or "").strip())
+    if not migration:
+        return jsonify({"ok": False, "error": "Unknown migration"}), 404
+    apply = bool(data.get("apply")) and migration.get("supports_apply", False)
+
+    cmd = [sys.executable, str(_ROOT / migration["script"])]
+    if apply:
+        cmd.append("--apply")
+
+    mode = "apply" if apply else "dry-run"
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(_ROOT), capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        audit.record("run", "migration", entity_label=migration["id"], details=f"{mode}: timed out")
+        return jsonify({"ok": False, "error": "Migration timed out after 600s"}), 504
+    except Exception:
+        logger.exception("run_migration failed: %s", migration["id"])
+        return jsonify({"ok": False, "error": "Could not run migration."}), 500
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    ok = proc.returncode == 0
+    audit.record(
+        "run", "migration", entity_label=migration["id"],
+        details=f"{mode}: {'ok' if ok else f'exit {proc.returncode}'}",
+    )
+    return jsonify({"ok": ok, "mode": mode, "output": output, "returncode": proc.returncode})
+
+
+@bp.route("/config/sources/save-scraper", methods=["POST"])
+def save_scraper_config():
+    """Save only the MISP scraper connection settings."""
+    current = _read()
+    url = request.form.get("MISP_URL", "").strip()
+    key = _kept_secret(request.form.get("MISP_KEY", "").strip(), current["MISP_KEY"], url, current["MISP_URL"])
+    if key is None:
+        flash(_reenter_message("scraper API key"), "warning")
+        return redirect(url_for("collection_sources.index"))
+    current["MISP_SCRAPER_ENABLED"] = request.form.get("MISP_SCRAPER_ENABLED") == "true"
+    current["MISP_URL"] = url
+    current["MISP_KEY"] = key
+    current["MISP_VERIFYCERT"] = request.form.get("MISP_VERIFYCERT") == "true"
+    current["MISP_SCRAPER_LIMIT"] = max(1, _form_int("MISP_SCRAPER_LIMIT", 500))
+    current["MISP_SCRAPER_SINCE_DAYS"] = max(0, _form_int("MISP_SCRAPER_SINCE_DAYS", 0))
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record("update", "config", entity_label="misp-scraper")
+        flash("MISP scraper settings saved.", "success")
+    except Exception:
+        logger.exception("save_scraper_config failed")
+        flash("Could not save configuration.", "warning")
+    return redirect(url_for("collection_sources.index"))
+
+
+@bp.route("/config/sources/save-scraper-redis", methods=["POST"])
+def save_scraper_redis_config():
+    """Save the misp-scraper Redis queue settings used by newsletter imports."""
+    current = _read()
+    host = request.form.get("SCRAPER_REDIS_HOST", "").strip()
+    if request.form.get("remove_SCRAPER_REDIS_PASSWORD") == "true":
+        password = ""
+    else:
+        password = _kept_secret(request.form.get("SCRAPER_REDIS_PASSWORD", ""),
+                                current["SCRAPER_REDIS_PASSWORD"], host, current["SCRAPER_REDIS_HOST"])
+    if password is None:
+        flash(_reenter_message("scraper queue password"), "warning")
+        return redirect(url_for("collection_sources.index"))
+    current["SCRAPER_REDIS_HOST"] = host
+    try:
+        current["SCRAPER_REDIS_PORT"] = _form_int("SCRAPER_REDIS_PORT", 6379)
+    except (ValueError, TypeError):
+        current["SCRAPER_REDIS_PORT"] = 6379
+    current["SCRAPER_REDIS_PASSWORD"] = password
+    current["SCRAPER_REDIS_CHANNEL"] = request.form.get("SCRAPER_REDIS_CHANNEL", "").strip() or "urls"
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record("update", "config", entity_label="scraper-redis")
+        flash("Scraper queue settings saved.", "success")
+    except Exception:
+        logger.exception("save_scraper_redis_config failed")
+        flash("Could not save configuration.", "warning")
+    return redirect(url_for("collection_sources.index"))
+
+
+@bp.route("/config/sources/save-server", methods=["POST"])
+@rate_limited("config_save_server", limit=60, window_s=60)
+def save_server_config():
+    """Add or update a single MISP server entry (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    original_id = (data.get("original_id") or "").strip()
+    label = (data.get("label") or "").strip()
+    url = (data.get("url") or "").strip()
+    if not label and not url:
+        return jsonify({"ok": False, "error": "Label or URL required"}), 400
+    sid = (data.get("id") or "").strip()
+    if not sid:
+        sid = "".join(c.lower() if c.isalnum() else "-" for c in label).strip("-") or "server"
+    try:
+        since = max(1, min(3650, int(data.get("since_days") or 7)))
+    except (ValueError, TypeError):
+        since = 7
+    try:
+        limit = max(1, int(data.get("limit") or 500))
+    except (ValueError, TypeError):
+        limit = 500
+    try:
+        verify_tls = _parse_bool(data.get("verify_tls", True), default=True)
+        enabled = _parse_bool(data.get("enabled", True), default=True)
+        allow_reports = _parse_bool(data.get("allow_reports", False), default=False)
+        analyse = _parse_bool(data.get("analyse", False), default=False)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    # Only organisation UUIDs ever match, and the page shows the value back.
+    org_filter = (data.get("org_filter") or "").strip()
+    if not all(misp_store._UUID_RE.fullmatch(u) for u in _split_tags(org_filter)):
+        return jsonify({"ok": False, "error": "The organisation filter takes organisation UUIDs only"}), 400
+
+    current = _read()
+    servers = list(current.get("MISP_SERVERS") or [])
+    old = next((s for s in servers if original_id and s.get("id") == original_id), {})
+    api_key = _kept_secret((data.get("api_key") or "").strip(), old.get("api_key"), url, old.get("url"))
+    if api_key is None:
+        return jsonify({"ok": False, "error": _reenter_message("API key")}), 400
+    entry = {
+        "id": sid,
+        "label": label,
+        "url": url,
+        "api_key": api_key,
+        "verify_tls": verify_tls,
+        "enabled": enabled,
+        "allow_reports": allow_reports,
+        "analyse": analyse,
+        "tags": (data.get("tags") or "").strip(),
+        "tags_and": (data.get("tags_and") or "").strip(),
+        "tags_not": (data.get("tags_not") or "").strip(),
+        "org_filter_type": (data.get("org_filter_type") or "").strip(),
+        "org_filter": org_filter,
+        "since_days": since,
+        "limit": limit,
+    }
+    action = "create"
+    if original_id:
+        for i, s in enumerate(servers):
+            if s.get("id") == original_id:
+                servers[i] = entry
+                action = "update"
+                break
+        if action == "create":
+            servers.append(entry)
+    else:
+        servers.append(entry)
+    current["MISP_SERVERS"] = servers
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record(action, "misp_server", entity_label=label)
+        return jsonify({"ok": True, "new_id": sid})
+    except Exception:
+        logger.exception("save_server_config failed")
+        audit.record(action, "misp_server", entity_label=label, details="failed")
+        return jsonify({"ok": False, "error": "Could not save server settings."}), 500
+
+
+@bp.route("/config/sources/delete-server", methods=["POST"])
+@rate_limited("config_delete_server", limit=60, window_s=60)
+def delete_server_config():
+    """Remove a single MISP server entry by ID (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    server_id = (data.get("server_id") or "").strip()
+    if not server_id:
+        return jsonify({"ok": False, "error": "server_id required"}), 400
+    current = _read()
+    servers = current.get("MISP_SERVERS") or []
+    label = next((s.get("label", server_id) for s in servers if s.get("id") == server_id), server_id)
+    current["MISP_SERVERS"] = [s for s in servers if s.get("id") != server_id]
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record("delete", "misp_server", entity_label=label)
+        return jsonify({"ok": True})
+    except Exception:
+        logger.exception("delete_server_config failed")
+        audit.record("delete", "misp_server", entity_label=label, details="failed")
+        return jsonify({"ok": False, "error": "Could not delete server."}), 500
+
+
+def _str_list(value) -> list[str]:
+    """Accept a list or a newline/comma string and return a clean list of strings."""
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, str):
+        items = value.replace(",", "\n").splitlines()
+    else:
+        items = []
+    return [str(i).strip() for i in items if str(i).strip()]
+
+
+def _slug_id(name: str, fallback: str, taken: set | None = None) -> str:
+    """Kebab-case identifier from a display name, with repeated dashes collapsed.
+
+    Pass `taken` to number off a name that is already spoken for, so two entries
+    named alike do not end up sharing an id.
+    """
+    raw = "".join(c.lower() if c.isalnum() else "-" for c in name)
+    slug = "-".join(p for p in raw.split("-") if p) or fallback
+    candidate, n = slug, 2
+    while taken and candidate in taken:
+        candidate, n = f"{slug}-{n}", n + 1
+    return candidate
+
+
+def _build_imap_source(raw: dict, position: int, taken_ids: set) -> dict:
+    """Validate one collection source from the save payload. Raises ValueError."""
+    name = (raw.get("name") or "").strip()
+    if not name:
+        raise ValueError("Each collection source needs a name")
+    parser = (raw.get("parser") or "").strip()
+    if parser not in newsletter_parsers.available_sources():
+        # Escape the echoed value: it is reflected back in the JSON error response.
+        raise ValueError(f"Unknown newsletter parser '{escape(parser)}'")
+    mode = (raw.get("mode") or "auto").strip().lower()
+    if mode not in ("auto", "manual"):
+        mode = "auto"
+    sid = _slug_id(name, f"source-{position}", taken_ids)
+    taken_ids.add(sid)
+    return {
+        "id": sid,
+        "name": name,
+        "enabled": _parse_bool(raw.get("enabled", True), default=True),
+        "parser": parser,
+        "subjects": _str_list(raw.get("subjects")),
+        "senders": _str_list(raw.get("senders")),
+        "reliability": (raw.get("reliability") or "").strip().upper(),
+        "mode": mode,
+    }
+
+
+@bp.route("/config/sources/save-imap", methods=["POST"])
+@rate_limited("config_save_imap", limit=60, window_s=60)
+def save_imap_mailbox():
+    """Add or update one IMAP mailbox and its collection sources (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    name = (data.get("name") or "").strip()
+    host = (data.get("host") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Mailbox name required"}), 400
+    if not host:
+        return jsonify({"ok": False, "error": "IMAP host required"}), 400
+    try:
+        ssl_on = _parse_bool(data.get("ssl", True), default=True)
+        enabled = _parse_bool(data.get("enabled", True), default=True)
+        port = int(data.get("port") or (993 if ssl_on else 143))
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "Port must be a number"}), 400
+
+    try:
+        taken_ids = set()
+        sources = [_build_imap_source(s, i + 1, taken_ids)
+                   for i, s in enumerate(data.get("sources") or [])]
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    sid = (data.get("id") or "").strip() or _slug_id(name, "mailbox")
+    original_id = (data.get("original_id") or "").strip()
+    current = _read()
+    mailboxes = list(current.get("IMAP_SOURCES") or [])
+    old = next((m for m in mailboxes if original_id and m.get("id") == original_id), {})
+    username = (data.get("username") or "").strip()
+    password = _kept_secret(data.get("password") or "", old.get("password"),
+                            f"{username}@{host}", f"{old.get('username')}@{old.get('host')}")
+    if password is None:
+        return jsonify({"ok": False, "error": _reenter_message("password")}), 400
+    entry = {
+        "id": sid,
+        "name": name,
+        "enabled": enabled,
+        "host": host,
+        "port": port,
+        "ssl": ssl_on,
+        "username": username,
+        "password": password,
+        "folder": (data.get("folder") or "INBOX").strip() or "INBOX",
+        "sources": sources,
+    }
+    action = "create"
+    if original_id:
+        for i, m in enumerate(mailboxes):
+            if m.get("id") == original_id:
+                mailboxes[i] = entry
+                action = "update"
+                break
+        else:
+            mailboxes.append(entry)
+    else:
+        mailboxes.append(entry)
+    current["IMAP_SOURCES"] = mailboxes
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record(action, "imap_mailbox", entity_label=name)
+        return jsonify({"ok": True, "new_id": sid})
+    except Exception:
+        logger.exception("save_imap_mailbox failed")
+        return jsonify({"ok": False, "error": "Could not save mailbox."}), 500
+
+
+@bp.route("/config/sources/delete-imap", methods=["POST"])
+@rate_limited("config_delete_imap", limit=60, window_s=60)
+def delete_imap_mailbox():
+    """Remove a single IMAP mailbox source by ID (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    mailbox_id = (data.get("mailbox_id") or "").strip()
+    if not mailbox_id:
+        return jsonify({"ok": False, "error": "mailbox_id required"}), 400
+    current = _read()
+    sources = current.get("IMAP_SOURCES") or []
+    label = next((s.get("name", mailbox_id) for s in sources if s.get("id") == mailbox_id), mailbox_id)
+    current["IMAP_SOURCES"] = [s for s in sources if s.get("id") != mailbox_id]
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record("delete", "imap_mailbox", entity_label=label)
+        return jsonify({"ok": True})
+    except Exception:
+        logger.exception("delete_imap_mailbox failed")
+        return jsonify({"ok": False, "error": "Could not delete mailbox."}), 500
+
+
+@bp.route("/config/sources/test-imap", methods=["POST"])
+@rate_limited("config_test_imap", limit=20, window_s=60)
+def test_imap_mailbox():
+    """Check that an IMAP mailbox can be opened with the supplied settings (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    from core import imap_collector
+
+    host = (data.get("host") or "").strip()
+    if not host:
+        return jsonify({"ok": False, "error": "IMAP host is required"}), 400
+    try:
+        ssl_on = _parse_bool(data.get("ssl", True), default=True)
+        port = int(data.get("port") or (993 if ssl_on else 143))
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "Port must be a number"}), 400
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or _stored_secret_for(
+        f"{username}@{host}",
+        [(f"{m.get('username')}@{m.get('host')}", m.get("password"))
+         for m in getattr(_config, "IMAP_SOURCES", []) or []],
+    )
+    result = imap_collector.test_connection(
+        host, port, ssl_on, username, password,
+        (data.get("folder") or "INBOX").strip() or "INBOX",
+    )
+    return jsonify(result)
+
+
+def _stored_misp_servers():
+    """(URL, key, TLS verification) for each configured MISP server."""
+    servers = [
+        (getattr(_config, "MISP_WEBAPP_URL", ""), getattr(_config, "MISP_WEBAPP_KEY", ""),
+         getattr(_config, "MISP_WEBAPP_VERIFYCERT", True)),
+        (getattr(_config, "MISP_URL", ""), getattr(_config, "MISP_KEY", ""),
+         getattr(_config, "MISP_VERIFYCERT", True)),
+    ]
+    servers.extend(
+        (server.get("url"), server.get("api_key"), server.get("verify_tls", True))
+        for server in getattr(_config, "MISP_SERVERS", []) or []
+    )
+    return servers
+
+
+def _stored_misp_keys():
+    """(URL, key) of every MISP server zsazsa holds a key for."""
+    return [(url, key) for url, key, _verify in _stored_misp_servers()]
+
+
+def _stored_verify_tls(url):
+    """Whether TLS is verified for a MISP server, as stored with its URL. On for
+    a URL zsazsa has no setting for."""
+    return next((bool(verify) for addr, _key, verify in _stored_misp_servers()
+                 if _same_address(addr, url)), True)
+
+
+@bp.route("/config/sources/pull-estimate", methods=["POST"])
+@rate_limited("config_pull_estimate", limit=20, window_s=60)
+def pull_estimate():
+    """Estimate how many events a MISP server would return with the current filter settings.
+
+    POST JSON: {misp_url, misp_key, verify_tls, tags, tags_and, tags_not,
+                since_days, org_filter_type, org_filter}
+    Returns {"count": N, "error": null}.
+    """
+    import datetime as _dt
+    from pymisp import PyMISP
+
+    body, err = _json_object()
+    if err:
+        return jsonify({"count": None, "error": "Invalid JSON payload."}), 400
+    misp_url = (body.get("misp_url") or "").strip()
+    misp_key = (body.get("misp_key") or "").strip() or _stored_secret_for(misp_url, _stored_misp_keys())
+    if not misp_url or not misp_key:
+        return jsonify({"count": None, "error": "URL and API key required."})
+
+    try:
+        verify_tls = _parse_bool(body.get("verify_tls", False), default=False)
+    except ValueError as exc:
+        return jsonify({"count": None, "error": str(exc)}), 400
+    tags_or = _split_tags(body.get("tags") or "")
+    tags_and = _split_tags(body.get("tags_and") or "")
+    tags_not = _split_tags(body.get("tags_not") or "")
+    since_days = int(body.get("since_days") or 0)
+    org_filter_type = (body.get("org_filter_type") or "").strip()
+    org_filter = {u.lower() for u in _split_tags(body.get("org_filter") or "")}
+    try:
+        limit = max(1, int(body.get("limit") or 500))
+    except (ValueError, TypeError):
+        limit = 500
+
+    try:
+        m = PyMISP(misp_url, misp_key, verify_tls, timeout=misp_store.HTTP_TIMEOUT)
+        use_published = body.get("published", True)
+        # Asked as the cache refresh asks, so the estimate is what a refresh stores.
+        kwargs = dict(limit=limit, page=1, metadata=True, pythonify=True, order=misp_store.NEWEST_FIRST)
+        if use_published:
+            kwargs["published"] = True
+        tags = partner_tag_filter(m, {"tags": tags_or, "tags_and": tags_and, "tags_not": tags_not})
+        if tags:
+            kwargs["tags"] = tags
+        if since_days:
+            cutoff = (_dt.date.today() - _dt.timedelta(days=since_days)).isoformat()
+            kwargs["date_from"] = cutoff
+        events = m.search(**kwargs)
+        if not events or isinstance(events, dict):
+            return jsonify({"count": 0, "error": None})
+
+        events = filter_events_by_org(events, org_filter_type, org_filter)
+
+        return jsonify({"count": len(events), "error": None})
+    except Exception as exc:
+        logger.warning("pull_estimate failed: %s", exc)
+        return jsonify({"count": None, "error": "Pull estimate failed."}), 502
+
+
+@bp.route("/config/sources/lookup-org", methods=["POST"])
+@rate_limited("config_lookup_org", limit=60, window_s=60)
+def lookup_org():
+    """Look up a MISP organisation name by UUID.
+
+    POST JSON: {"uuid": "...", "misp_url": "...", "misp_key": "..."}
+    The misp_url / misp_key fields are optional. Without a key, the one stored
+    for misp_url is used, and the configured webapp and scraper MISP instances
+    are tried after it.
+    Returns {"name": "Org Name", "error": null} or {"name": null, "error": "..."}.
+    """
+    from pymisp import PyMISP
+    body, err = _json_object()
+    if err:
+        return jsonify({"name": None, "error": "Invalid JSON payload."}), 400
+    uuid = (body.get("uuid") or "").strip()
+    if not uuid:
+        return jsonify({"name": None, "error": "UUID required."})
+
+    misp_url = (body.get("misp_url") or "").strip()
+    misp_key = (body.get("misp_key") or "").strip() or _stored_secret_for(misp_url, _stored_misp_keys())
+
+    servers = []
+    if misp_url and misp_key:
+        servers.append((misp_url, misp_key, _stored_verify_tls(misp_url)))
+    servers.append((_config.MISP_WEBAPP_URL, _config.MISP_WEBAPP_KEY, _config.MISP_WEBAPP_VERIFYCERT))
+    if scraper_enabled() and _config.MISP_URL != _config.MISP_WEBAPP_URL:
+        servers.append((_config.MISP_URL, _config.MISP_KEY, _config.MISP_VERIFYCERT))
+
+    for url, key, verify in servers:
+        try:
+            m = PyMISP(url, key, verify)
+            result = m.get_organisation(uuid, pythonify=True)
+            if result and not isinstance(result, dict):
+                return jsonify({"name": result.name, "error": None})
+        except Exception as exc:
+            logger.debug("lookup_org failed against %s: %s", url, exc)
+            continue
+
+    return jsonify({"name": None, "error": "Not found."})
+
+
+@bp.route("/config/test_misp_connection", methods=["POST"])
+@rate_limited("config_test_misp_connection", limit=20, window_s=60)
+def test_misp_connection():
+    data, err = _json_object()
+    if err:
+        return err
+    url = (data.get("url") or "").strip()
+    api_key = (data.get("api_key") or "").strip() or _stored_secret_for(url, _stored_misp_keys())
+    try:
+        verify_tls = _parse_bool(data.get("verify_tls", True), default=True)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if not url or not api_key:
+        return jsonify({"ok": False, "error": "URL and API key are required"}), 400
+    result = misp_store._test_connection(url, api_key, verify_tls)
+    audit.record("test", "misp_connection", entity_label=url, details="ok" if result.get("ok") else result.get("error"))
+    return jsonify(result)
+
+
+@bp.route("/config/server_usage")
+def server_usage():
+    """Return PIR/GIR counts that reference a given collection source label."""
+    label = request.args.get("label", "").strip()
+    if not label:
+        return jsonify({"ok": False, "error": "label required"}), 400
+    try:
+        pirs = misp_store.list_pirs()
+        girs = misp_store.list_girs()
+        pir_count = sum(1 for p in pirs if label in (p.collection_sources or []))
+        gir_count = sum(1 for g in girs if label in (g.collection_sources or []))
+        return jsonify({"ok": True, "pir_count": pir_count, "gir_count": gir_count,
+                        "in_use": (pir_count + gir_count) > 0})
+    except Exception:
+        logger.exception("server_usage failed")
+        return jsonify({"ok": False, "error": "Could not compute server usage."}), 500
+
+
+@bp.route("/config/test-sso")
+@rate_limited("config_test_sso", limit=20, window_s=60)
+def test_sso():
+    """Report why single sign-on did or did not identify this request (AJAX)."""
+    try:
+        return jsonify({"ok": True, **misp_session.diagnose(request.cookies)})
+    except Exception:
+        logger.exception("test_sso failed")
+        return jsonify({"ok": False, "error": "Could not run the single sign-on check."}), 500
+
+
+@bp.route("/config/save-notification-channel", methods=["POST"])
+@rate_limited("config_save_notification_channel", limit=30, window_s=60)
+def save_notification_channel():
+    """Add or update a single notification channel entry (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    original_id = (data.get("original_id") or "").strip()
+    name = (data.get("name") or "").strip()
+    url = (data.get("url") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Name required"}), 400
+    try:
+        enabled = _parse_bool(data.get("enabled", True), default=True)
+        verify_tls = _parse_bool(data.get("verify_tls", True), default=True)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    channel_type = (data.get("type") or "mattermost").strip().lower()
+    if channel_type not in ("mattermost", "teams", "email"):
+        return jsonify({"ok": False, "error": "Unknown channel type"}), 400
+    recipient = (data.get("recipient") or "").strip()
+    if channel_type == "email" and not recipient:
+        return jsonify({"ok": False, "error": "Recipient email address required"}), 400
+
+    current = _read()
+    channels = list(current.get("NOTIFICATION_CHANNELS") or [])
+    index = next((i for i, ch in enumerate(channels) if ch.get("id") == original_id), None) if original_id else None
+    if not url and index is not None:
+        url = channels[index].get("url") or ""
+    if index is None:
+        # Stakeholders subscribe by id, so two channels named alike must not share
+        # one: a collision would deliver to both.
+        cid = (data.get("id") or "").strip() or _slug_id(name, "channel", {ch.get("id") for ch in channels})
+    else:
+        # A rename keeps the id it was subscribed under; re-deriving it would leave
+        # every subscription pointing at a channel that no longer exists.
+        cid = original_id
+
+    entry = {
+        "id": cid,
+        "name": name,
+        "type": channel_type,
+        "url": url,
+        "enabled": enabled,
+        "verify_tls": verify_tls,
+    }
+    if channel_type == "email":
+        entry["recipient"] = recipient
+    if index is None:
+        action = "create"
+        channels.append(entry)
+    else:
+        action = "update"
+        channels[index] = entry
+    current["NOTIFICATION_CHANNELS"] = channels
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record(action, "notification_channel", entity_label=name)
+        return jsonify({"ok": True, "new_id": cid})
+    except Exception:
+        logger.exception("save_notification_channel failed")
+        return jsonify({"ok": False, "error": "Could not save notification channel."}), 500
+
+
+@bp.route("/config/delete-notification-channel", methods=["POST"])
+@rate_limited("config_delete_notification_channel", limit=30, window_s=60)
+def delete_notification_channel():
+    """Remove a notification channel by ID (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    channel_id = (data.get("channel_id") or "").strip()
+    if not channel_id:
+        return jsonify({"ok": False, "error": "channel_id required"}), 400
+    current = _read()
+    channels = current.get("NOTIFICATION_CHANNELS") or []
+    label = next((c.get("name", channel_id) for c in channels if c.get("id") == channel_id), channel_id)
+    current["NOTIFICATION_CHANNELS"] = [c for c in channels if c.get("id") != channel_id]
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record("delete", "notification_channel", entity_label=label)
+        return jsonify({"ok": True})
+    except Exception:
+        logger.exception("delete_notification_channel failed")
+        return jsonify({"ok": False, "error": "Could not delete notification channel."}), 500
+
+
+@bp.route("/config/ping-notification-channel", methods=["POST"])
+@rate_limited("config_ping_notification_channel", limit=10, window_s=60)
+def ping_notification_channel():
+    data, err = _json_object()
+    if err:
+        return err
+    channel_id = (data.get("channel_id") or "").strip()
+    if not channel_id:
+        return jsonify({"ok": False, "error": "channel_id required"}), 400
+    channels = _read_notification_channels()
+    ch = next((c for c in channels if c.get("id") == channel_id), None)
+    if not ch:
+        return jsonify({"ok": False, "error": "Channel not found"}), 404
+    if (ch.get("type") or "").strip().lower() == "email":
+        from notifier import email
+
+        recipient = (ch.get("recipient") or "").strip()
+        if not recipient:
+            return jsonify({"ok": False, "error": "Channel has no recipient address configured"}), 400
+        ok = email.send_email(
+            [recipient],
+            "zsazsa test notification",
+            "This is a **zsazsa** test notification. The email channel is configured correctly.",
+            f"test {channel_id}",
+        )
+        if ok:
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": "Send failed. Check SMTP settings and logs."})
+    url = (ch.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "Channel has no webhook URL configured"}), 400
+    verify_tls = bool(ch.get("verify_tls", True))
+    if (ch.get("type") or "").strip().lower() == "teams":
+        # The Workflows template posts the attached card and fails on a bare text message.
+        from notifier import teams
+        payload = teams.ping_message()
+    else:
+        payload = {"text": "zsazsa test notification: channel is reachable."}
+    try:
+        r = requests.post(url, json=payload, timeout=10, verify=verify_tls)
+        r.raise_for_status()
+        return jsonify({"ok": True})
+    except requests.RequestException as exc:
+        # The settings never send a stored webhook back, and requests names the URL.
+        from notifier.mattermost import without_secret
+        return jsonify({"ok": False, "error": without_secret(str(exc), url)})
+
+
+@bp.route("/config/save-flowintel-instance", methods=["POST"])
+@rate_limited("config_save_flowintel_instance", limit=30, window_s=60)
+def save_flowintel_instance():
+    """Add or update a single Flowintel instance entry (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    original_id = (data.get("original_id") or "").strip()
+    name = (data.get("name") or "").strip()
+    url = (data.get("url") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Name required"}), 400
+    if not url:
+        return jsonify({"ok": False, "error": "URL required"}), 400
+    current = _read()
+    instances = list(current.get("FLOWINTEL_INSTANCES") or [])
+    old = next((i for i in instances if original_id and i.get("id") == original_id), {})
+    api_key = _kept_secret((data.get("api_key") or "").strip(), old.get("api_key"), url, old.get("url"))
+    if api_key is None:
+        return jsonify({"ok": False, "error": _reenter_message("API key")}), 400
+    cid = (data.get("id") or "").strip()
+    if not cid:
+        cid = "".join(c.lower() if c.isalnum() else "-" for c in name).strip("-") or "flowintel"
+    try:
+        enabled = _parse_bool(data.get("enabled", True), default=True)
+        verify_tls = _parse_bool(data.get("verify_tls", True), default=True)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    case_templates_raw = data.get("case_templates") or {}
+    case_templates = {}
+    if isinstance(case_templates_raw, dict):
+        for product in FLOWINTEL_CASE_TEMPLATE_PRODUCTS:
+            ct = case_templates_raw.get(product["key"])
+            if isinstance(ct, dict):
+                case_templates[product["key"]] = {
+                    "enabled": bool(ct.get("enabled")),
+                    "template_id": str(ct.get("template_id") or "").strip(),
+                    "initial_task": str(ct.get("initial_task") or "").strip(),
+                }
+
+    entry = {
+        "id": cid,
+        "name": name,
+        "url": url,
+        "api_key": api_key,
+        "enabled": enabled,
+        "verify_tls": verify_tls,
+        "case_templates": case_templates,
+    }
+    action = "create"
+    if original_id:
+        for i, inst in enumerate(instances):
+            if inst.get("id") == original_id:
+                instances[i] = entry
+                action = "update"
+                break
+        if action == "create":
+            instances.append(entry)
+    else:
+        instances.append(entry)
+    current["FLOWINTEL_INSTANCES"] = instances
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record(action, "flowintel_instance", entity_label=name)
+        return jsonify({"ok": True, "new_id": cid})
+    except Exception:
+        logger.exception("save_flowintel_instance failed")
+        return jsonify({"ok": False, "error": "Could not save Flowintel instance."}), 500
+
+
+@bp.route("/config/delete-flowintel-instance", methods=["POST"])
+@rate_limited("config_delete_flowintel_instance", limit=30, window_s=60)
+def delete_flowintel_instance():
+    """Remove a Flowintel instance by ID (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    instance_id = (data.get("instance_id") or "").strip()
+    if not instance_id:
+        return jsonify({"ok": False, "error": "instance_id required"}), 400
+    current = _read()
+    instances = current.get("FLOWINTEL_INSTANCES") or []
+    label = next((i.get("name", instance_id) for i in instances if i.get("id") == instance_id), instance_id)
+    current["FLOWINTEL_INSTANCES"] = [i for i in instances if i.get("id") != instance_id]
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record("delete", "flowintel_instance", entity_label=label)
+        return jsonify({"ok": True})
+    except Exception:
+        logger.exception("delete_flowintel_instance failed")
+        return jsonify({"ok": False, "error": "Could not delete Flowintel instance."}), 500
+
+
+def _stored_flowintel_keys():
+    return [(i.get("url"), i.get("api_key")) for i in getattr(_config, "FLOWINTEL_INSTANCES", []) or []]
+
+
+@bp.route("/config/test-flowintel-connection", methods=["POST"])
+@rate_limited("config_test_flowintel_connection", limit=20, window_s=60)
+def test_flowintel_connection():
+    """Check connectivity to a Flowintel instance without sending any data."""
+    data, err = _json_object()
+    if err:
+        return err
+    url = (data.get("url") or "").strip().rstrip("/")
+    api_key = (data.get("api_key") or "").strip() or _stored_secret_for(url, _stored_flowintel_keys())
+    try:
+        verify_tls = _parse_bool(data.get("verify_tls", True), default=True)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if not url or not api_key:
+        return jsonify({"ok": False, "error": "URL and API key are required"}), 400
+    return jsonify(flowintel_client.test_connection(url, api_key, verify_tls))
+
+
+@bp.route("/config/save-smtp", methods=["POST"])
+@rate_limited("config_save_smtp", limit=20, window_s=60)
+def save_smtp():
+    """Save the SMTP server the email channels send through (AJAX)."""
+    data, err = _json_object()
+    if err:
+        return err
+    host = (data.get("host") or "").strip()
+    sender = (data.get("from") or "").strip()
+    if host and not sender:
+        return jsonify({"ok": False, "error": _SMTP_FROM_MISSING}), 400
+    try:
+        port = int(data.get("port") or 587)
+        use_tls = _parse_bool(data.get("use_tls", True), default=True)
+    except ValueError:
+        return jsonify({"ok": False, "error": "Port must be a number"}), 400
+    current = _read()
+    password = "" if data.get("remove_password") else _kept_secret(
+        (data.get("password") or "").strip(), current["SMTP_PASSWORD"], host, current["SMTP_HOST"])
+    if password is None:
+        return jsonify({"ok": False, "error": _reenter_message("SMTP password")}), 400
+    current.update({
+        "SMTP_HOST": host,
+        "SMTP_PORT": port,
+        "SMTP_USE_TLS": use_tls,
+        "SMTP_USERNAME": (data.get("username") or "").strip(),
+        "SMTP_PASSWORD": password,
+        "SMTP_FROM": sender,
+        "SMTP_SENDER_NAME": (data.get("sender_name") or "").strip(),
+    })
+    try:
+        _write(current)
+        importlib.reload(_config)
+        audit.record("update", "config", details="SMTP server saved")
+        return jsonify({"ok": True})
+    except Exception:
+        logger.exception("save_smtp failed")
+        return jsonify({"ok": False, "error": "Could not save the SMTP settings."}), 500
+
+
+@bp.route("/config/test-smtp-connection", methods=["POST"])
+@rate_limited("config_test_smtp_connection", limit=20, window_s=60)
+def test_smtp_connection():
+    """Check SMTP connectivity using the supplied settings, without sending mail."""
+    data, err = _json_object()
+    if err:
+        return err
+    from notifier import email
+
+    host = (data.get("host") or "").strip()
+    if not host:
+        return jsonify({"ok": False, "error": "SMTP host is required"}), 400
+    try:
+        port = int(data.get("port") or 587)
+        use_tls = _parse_bool(data.get("use_tls", True), default=True)
+    except ValueError:
+        return jsonify({"ok": False, "error": "Port must be a number"}), 400
+    password = data.get("password") or _stored_secret_for(
+        host, [(getattr(_config, "SMTP_HOST", ""), getattr(_config, "SMTP_PASSWORD", ""))])
+    result = email.test_connection(host, port, use_tls, (data.get("username") or "").strip(), password)
+    return jsonify(result)
+
+
+@bp.route("/config/flowintel-case-templates", methods=["POST"])
+@rate_limited("config_flowintel_case_templates", limit=20, window_s=60)
+def flowintel_case_templates():
+    """Return the case templates available on a Flowintel instance, given connection details."""
+    data, err = _json_object()
+    if err:
+        return err
+    url = (data.get("url") or "").strip().rstrip("/")
+    api_key = (data.get("api_key") or "").strip() or _stored_secret_for(url, _stored_flowintel_keys())
+    try:
+        verify_tls = _parse_bool(data.get("verify_tls", True), default=True)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if not url or not api_key:
+        return jsonify({"ok": False, "error": "URL and API key are required"}), 400
+    return jsonify(flowintel_client.get_case_templates(url, api_key, verify_tls))
+
+
+@bp.route("/config/flowintel-case-template-tasks", methods=["POST"])
+@rate_limited("config_flowintel_case_template_tasks", limit=20, window_s=60)
+def flowintel_case_template_tasks():
+    """Return the tasks defined by a Flowintel case template, in order."""
+    data, err = _json_object()
+    if err:
+        return err
+    url = (data.get("url") or "").strip().rstrip("/")
+    api_key = (data.get("api_key") or "").strip() or _stored_secret_for(url, _stored_flowintel_keys())
+    template_id = (data.get("template_id") or "").strip()
+    try:
+        verify_tls = _parse_bool(data.get("verify_tls", True), default=True)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if not url or not api_key or not template_id:
+        return jsonify({"ok": False, "error": "URL, API key and template_id are required"}), 400
+    return jsonify(flowintel_client.get_case_template_tasks(url, api_key, template_id, verify_tls))
+
+
+@bp.route("/config/upload-logo", methods=["POST"])
+@rate_limited("config_upload_logo", limit=10, window_s=60)
+def upload_logo():
+    f = request.files.get("logo")
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "No file provided"}), 400
+    ext = Path(f.filename).suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg"):
+        return jsonify({"ok": False, "error": "Only PNG and JPG files are accepted"}), 400
+    # One byte more than the limit is enough to know it is too large.
+    content = f.read(_LOGO_MAX_BYTES + 1)
+    if len(content) > _LOGO_MAX_BYTES:
+        return jsonify({"ok": False, "error": "The logo is larger than 2 MB"}), 400
+    _UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    for old in _UPLOADS_DIR.glob("logo.*"):
+        old.unlink(missing_ok=True)
+    dest = _UPLOADS_DIR / f"logo{ext}"
+    dest.write_bytes(content)
+    current = _read()
+    current["BRAND_LOGO"] = dest.name
+    _write(current)
+    importlib.reload(_config)
+    audit.record("update", "config", details="logo uploaded")
+    return jsonify({"ok": True, "filename": dest.name})
+
+
+@bp.route("/config/logo")
+def serve_logo():
+    logo = getattr(_config, "BRAND_LOGO", "")
+    if not logo:
+        return "", 404
+    path = _UPLOADS_DIR / logo
+    if not path.exists():
+        return "", 404
+    mime = mimetypes.guess_type(str(path))[0] or "image/png"
+    return send_file(str(path), mimetype=mime)
+
+
+@bp.route("/config/prompts", methods=["POST"])
+@rate_limited("config_save_prompts", limit=30, window_s=60)
+def save_prompts():
+    data, err = _json_object()
+    if err:
+        return err
+    prompts = data.get("prompts", [])
+    if not isinstance(prompts, list):
+        return jsonify({"ok": False, "error": "Invalid payload"}), 400
+    _PROMPTS_DIR.mkdir(exist_ok=True)
+    prompts_dir = _PROMPTS_DIR.resolve()
+    try:
+        for entry in prompts:
+            filename = (entry.get("filename") or "").strip()
+            content = entry.get("content") or ""
+            if not filename or not filename.endswith(".md"):
+                return jsonify({"ok": False, "error": f"Invalid filename: {filename!r}"}), 400
+            target = (prompts_dir / filename).resolve()
+            if target.parent != prompts_dir:
+                return jsonify({"ok": False, "error": f"Unsafe filename: {filename!r}"}), 400
+            target.write_text(content, encoding="utf-8")
+    except Exception:
+        logger.exception("save_prompts failed")
+        audit.record("update", "prompt_templates", details="failed")
+        return jsonify({"ok": False, "error": "Could not save prompt templates."}), 500
+    filenames = ", ".join(e.get("filename", "") for e in prompts if e.get("filename"))
+    audit.record("update", "prompt_templates", details=filenames or f"{len(prompts)} file(s)")
+    return jsonify({"ok": True})
+
+
+def _posted_ai_connector(posted, current):
+    """The ai-connector settings from the AI tab, as (settings, error)."""
+    try:
+        port = int(posted.get("port"))
+        timeout = int(posted.get("timeout"))
+    except (TypeError, ValueError):
+        port = timeout = 0
+    if not 1 <= port <= 65535:
+        return None, "The AI-connector port must be a number between 1 and 65535."
+    if timeout < 1:
+        return None, "The AI-connector timeout must be a number of seconds."
+    api_base = (posted.get("openai_api_base") or "").strip()
+    module_url = (posted.get("url") or "").strip().rstrip("/")
+    typed_key = (posted.get("api_key") or "").strip()
+    api_key = "" if posted.get("remove_api_key") else _kept_secret(
+        typed_key, current["AI_CONNECTOR_API_KEY"], api_base, current["AI_CONNECTOR_OPENAI_API_BASE"])
+    # The module is handed the key to reach the endpoint, so a stored one stays
+    # only while the module does as well.
+    module_moved = f"{module_url}:{port}" != f"{current['AI_CONNECTOR_URL']}:{current['AI_CONNECTOR_PORT']}"
+    if api_key and not typed_key and module_moved:
+        api_key = None
+    if api_key is None:
+        return None, _reenter_message("AI-connector API key")
+    return {
+        "AI_CONNECTOR_ENABLED": bool(posted.get("enabled")),
+        "AI_CONNECTOR_URL": module_url,
+        "AI_CONNECTOR_PORT": port,
+        "AI_CONNECTOR_TIMEOUT": timeout,
+        "AI_CONNECTOR_SSL_VERIFY_PEER": bool(posted.get("ssl_verify_peer")),
+        "AI_CONNECTOR_SSL_VERIFY_HOST": bool(posted.get("ssl_verify_host")),
+        "AI_CONNECTOR_SSL_ALLOW_SELF_SIGNED": bool(posted.get("ssl_allow_self_signed")),
+        "AI_CONNECTOR_SSL_CAFILE": (posted.get("ssl_cafile") or "").strip(),
+        "AI_CONNECTOR_OPENAI_API_BASE": api_base,
+        "AI_CONNECTOR_API_KEY": api_key,
+        "AI_CONNECTOR_MODEL_ID": (posted.get("model_id") or "").strip(),
+    }, None
+
+
+@bp.route("/config/test-ai-connector", methods=["POST"])
+@rate_limited("config_test_ai_connector", limit=20, window_s=60)
+def test_ai_connector():
+    """Ping the AI-connector module with the settings on the page, saved or not."""
+    data, err = _json_object()
+    if err:
+        return err
+    settings, error = _posted_ai_connector(data, ai_connector.settings())
+    if error:
+        return jsonify({"ok": False, "error": error}), 400
+    return jsonify(ai_connector.ping(settings))
+
+
+@bp.route("/config/save-ai-features", methods=["POST"])
+@rate_limited("config_save_ai_features", limit=20, window_s=60)
+def save_ai_features():
+    data, err = _json_object()
+    if err:
+        return err
+    # The setup wizard saves the providers only. Its request has no features,
+    # and the per-feature settings stay as they are.
+    features = data.get("features")
+    providers_only = features is None and isinstance(data.get("providers"), dict)
+    if not providers_only and not isinstance(features, dict):
+        return jsonify({"ok": False, "error": "Invalid payload"}), 400
+    try:
+        from core.ai_config import save as _ai_save, FEATURES, PROVIDERS
+        # Validate: only accept known feature IDs and safe field values.
+        # ai_config.save() falls back to OpenAI for an unknown provider.
+        clean = {}
+        for fid, vals in (features or {}).items():
+            if fid not in FEATURES or not isinstance(vals, dict):
+                continue
+            model = (vals.get("model") or "").strip()
+            prompt = (vals.get("prompt") or "").strip()
+            if prompt and ("/" in prompt or "\\" in prompt):
+                return jsonify({"ok": False, "error": f"Invalid prompt filename: {prompt!r}"}), 400
+            clean[fid] = {
+                "provider": (vals.get("provider") or "").strip(),
+                "model": model,
+                # ai_config.save() drops anything that is not a usable number.
+                "temperature": vals.get("temperature"),
+                "prompt": prompt,
+            }
+
+        # Persist provider settings and the default model to config/__init__.py.
+        providers = data.get("providers")
+        default_model = (data.get("default_model") or "").strip()
+        if default_model or isinstance(providers, dict):
+            current = _read()
+            if default_model:
+                current["OPENAI_MODEL"] = default_model
+            if isinstance(providers, dict):
+                openai_p = providers.get("openai") or {}
+                local_p = providers.get("local") or {}
+                local_url = (local_p.get("url") or "").strip()
+                # OpenAI has one fixed address, so its key stays unless replaced or removed.
+                openai_key = "" if openai_p.get("remove_api_key") else (
+                    (openai_p.get("api_key") or "").strip() or current["OPENAI_API_KEY"])
+                local_key = "" if local_p.get("remove_api_key") else _kept_secret(
+                    (local_p.get("api_key") or "").strip(), current["LOCAL_LLM_API_KEY"],
+                    local_url, current["LOCAL_LLM_URL"])
+                if local_key is None:
+                    return jsonify({"ok": False, "error": _reenter_message("local LLM API key")}), 400
+                current["OPENAI_ENABLED"] = bool(openai_p.get("enabled"))
+                current["OPENAI_API_KEY"] = openai_key
+                current["LOCAL_LLM_ENABLED"] = bool(local_p.get("enabled"))
+                current["LOCAL_LLM_URL"] = local_url
+                current["LOCAL_LLM_API_KEY"] = local_key
+                current["LOCAL_LLM_MODEL"] = (local_p.get("model") or "").strip()
+                default_provider = (providers.get("default") or "").strip()
+                if default_provider in PROVIDERS:
+                    current["LLM_DEFAULT_PROVIDER"] = default_provider
+                # The setup wizard does not show the module, so it sends nothing for it.
+                if isinstance(providers.get("ai_connector"), dict):
+                    connector, error = _posted_ai_connector(providers["ai_connector"], current)
+                    if error:
+                        return jsonify({"ok": False, "error": error}), 400
+                    current.update(connector)
+            _write(current)
+            importlib.reload(_config)
+
+        if providers_only:
+            audit.record("update", "ai_features", details="AI providers saved")
+        else:
+            _ai_save(clean)
+            audit.record("update", "ai_features", details=f"{len(clean)} feature(s) saved")
+        return jsonify({"ok": True})
+    except Exception:
+        logger.exception("save_ai_features failed")
+        return jsonify({"ok": False, "error": "Could not save AI feature settings."}), 500

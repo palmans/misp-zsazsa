@@ -1,0 +1,302 @@
+{% extends "base.html" %}
+{% from "_product_actions.html" import preview_button, approval_form with context %}
+{% from "_sort_header.html" import sort_th with context %}
+
+{% block title %}Threat actor profiles | zsazsa CTI{% endblock %}
+{% block page_title %}Threat actor profiles{% endblock %}
+
+{% block content %}
+{% import "_charts.html" as charts with context %}
+{% set drafts = taps | selectattr('status', 'equalto', 'Draft') | list %}
+{% set published = taps | selectattr('status', 'equalto', 'Published') | list %}
+{% set actors = taps | map(attribute='threat_actors') | select | sum(start=[]) | unique | list %}
+{% set published_dates = taps | selectattr('published_at') | map(attribute='published_at') | list %}
+{% set filtered = state_filter or tlp_filter or audience_filter %}
+
+<section class="record-hero record-hero-compact rise mb-3">
+  <div class="hero-main">
+    <span class="hero-icon" aria-hidden="true"><i class="fas fa-user-secret"></i></span>
+    <div class="record-kpis">
+      <div class="record-kpi"><b>{{ taps | length }}</b><span>profile{{ 's' if taps | length != 1 }}{{ ' shown' if filtered }}</span></div>
+      <a href="{{ charts.filtered_url('state', 'Draft', state_filter) }}" class="record-kpi{{ ' warn' if drafts }}"
+         title="{{ 'Show all again' if state_filter == 'Draft' else 'Show only the drafts' }}"><b>{{ drafts | length }}</b><span>draft{{ 's' if drafts | length != 1 }}</span></a>
+      <div class="record-kpi"><b>{{ published | length }}</b><span>published</span></div>
+      <div class="record-kpi"><b>{{ actors | length }}</b><span>threat actor{{ 's' if actors | length != 1 }} profiled</span></div>
+      {% if published_dates %}<div class="record-kpi"><b>{{ (published_dates | max).strftime('%d-%m') }}</b><span>last published</span></div>{% endif %}
+    </div>
+    <div class="hero-actions">
+      <a href="{{ url_for('threat_actor_profile.new') }}" class="btn btn-sm btn-hero"><i class="fas fa-plus me-1"></i> New threat actor profile</a>
+      <a href="{{ url_for('export.threat_actor_profiles') }}" class="btn btn-sm btn-hero-ghost" title="Export as Markdown">
+        <i class="fas fa-download me-1"></i> Export
+      </a>
+      <button type="button" class="btn btn-sm btn-hero-ghost" data-bs-toggle="collapse" data-bs-target="#product-flow"
+              aria-expanded="false" aria-controls="product-flow">
+        <i class="fas fa-circle-question me-1"></i> How a threat actor profile is made
+      </button>
+    </div>
+  </div>
+  {% if state_counts or tlp_counts or audience_counts %}
+  <div class="record-panel list-stats">
+    <div>{{ charts.mix('State', state_counts, charts.review_colors, param='state', selected=state_filter) }}</div>
+    <div>{{ charts.mix('TLP', tlp_counts, charts.tlp_colors, param='tlp', selected=tlp_filter) }}</div>
+    <div style="flex-grow:2.2;">{{ charts.mix('Audience', audience_counts, param='audience', selected=audience_filter, top=4) }}</div>
+  </div>
+  {% endif %}
+</section>
+
+<form method="get" class="card content-card list-filters record-filters rise rise-1 mb-4">
+  {{ charts.filter_select('state', 'State', 'fa-list-check', 'All states', states, state_filter) }}
+  {{ charts.filter_select('tlp', 'TLP', 'fa-traffic-light', 'All TLP levels', tlp_choices, tlp_filter) }}
+  {{ charts.filter_select('audience', 'Audience', 'fa-users', 'All audiences', audience_choices, audience_filter) }}
+  {% if filtered %}
+  <a href="{{ url_for('threat_actor_profile.review') }}" class="btn btn-xs btn-outline-secondary ms-auto">Clear</a>
+  {% endif %}
+</form>
+
+{% include "threat_actor_profile/_flow.html" %}
+
+{% set lanes = [('Draft', 'Draft', 'Finish and publish', 'var(--neutral-500)'),
+                ('Published', 'Published', 'Sent to their audience', 'var(--accent-green)')] %}
+<div class="card content-card rise rise-2">
+  <div class="card-body p-0">
+    {% if taps %}
+    <div class="table-responsive">
+    <table class="table table-hover zsazsa-table req-table product-table mb-0">
+      <thead>
+        <tr>
+          {{ sort_th('ID', 'id', sort, dir, 'threat_actor_profile.review', '110px') }}
+          {{ sort_th('Title', 'title', sort, dir, 'threat_actor_profile.review') }}
+          <th>TLP</th>
+          {{ sort_th('State', 'state', sort, dir, 'threat_actor_profile.review') }}
+          {{ sort_th('Published', 'date', sort, dir, 'threat_actor_profile.review') }}
+          <th>Author</th>
+          <th class="text-end">Actions</th>
+        </tr>
+      </thead>
+      {% for state, lane, hint, color in lanes %}
+      {# Anything but Published shows as a draft, as the badge in the row does. #}
+      {% set rows = (taps | selectattr('status', 'equalto', 'Published') | list) if state == 'Published'
+                     else (taps | rejectattr('status', 'equalto', 'Published') | list) %}
+      {% if rows %}
+      <tbody>
+        <tr class="lane-head">
+          <th colspan="7">
+            <span class="lane-mark" style="background:{{ color }};"></span>
+            <span class="lane-name">{{ lane }}</span>
+            <span class="lane-count">{{ rows | length }} profile{{ 's' if rows | length != 1 }}</span>
+            <span class="lane-hint">{{ hint }}</span>
+          </th>
+        </tr>
+        {% for t in rows %}
+        <tr class="{{ 'draft-row' if state == 'Draft' }}">
+          <td style="white-space:nowrap;">
+            <a href="{{ url_for('threat_actor_profile.detail', id=t.uuid) }}" class="text-decoration-none">
+              <span class="req-id-badge">{{ t.tap_id }}</span>
+            </a>
+          </td>
+          <td>
+            <a href="{{ url_for('threat_actor_profile.detail', id=t.uuid) }}" class="title{{ ' untitled' if not t.title }}">{{ t.title or 'No title' }}</a>
+            <div class="mt-1">
+              {% for a in t.threat_actors %}
+              <span class="badge chip-source" style="font-size:.63rem;">{{ a }}</span>
+              {% else %}
+              <span class="text-muted small">No threat actor picked yet</span>
+              {% endfor %}
+            </div>
+          </td>
+          <td><span class="tlp-badge tlp-{{ t.tlp | slug }}">TLP:{{ t.tlp | upper }}</span></td>
+          <td>
+            <div class="status-steps" aria-hidden="true" style="max-width:4rem;">
+              <i class="{{ 'done' if t.status == 'Published' else 'now' }}"></i><i class="{{ 'now' if t.status == 'Published' }}"></i>
+            </div>
+            {% if t.status == 'Published' %}<span class="badge bg-success">Published</span>
+            {% else %}<span class="badge bg-secondary">Draft</span>{% endif %}
+          </td>
+          <td style="white-space:nowrap;">{{ t.published_at.strftime('%Y-%m-%d') if t.published_at else '-' }}</td>
+          <td>{{ t.author or '-' }}</td>
+          <td class="text-end">
+            <div class="d-inline-flex flex-nowrap align-items-center justify-content-end gap-2">
+              <span class="d-inline-flex flex-nowrap gap-1">
+                {{ preview_button('tap-preview-' ~ t.uuid, t.status == 'Draft') }}
+                <button type="button" class="btn btn-xs btn-outline-secondary feedback-btn"
+                        data-action="{{ url_for('threat_actor_profile.add_feedback', id=t.uuid) }}" data-tap-id="{{ t.tap_id }}"
+                        data-bs-toggle="modal" data-bs-target="#feedback-modal" title="Give feedback">
+                  <i class="fas fa-comment-dots"></i>
+                </button>
+                {% if t.status == 'Published' %}
+                <a href="{{ url_for('threat_actor_profile.pdf', id=t.uuid) }}" class="btn btn-xs btn-outline-secondary" title="Download PDF">
+                  <i class="fas fa-file-pdf"></i>
+                </a>
+                <form method="post" action="{{ url_for('threat_actor_profile.notify', id=t.uuid) }}"
+                      class="d-inline" data-submit-confirm="Resend {{ t.tap_id }} to subscribed stakeholders?">
+                  <button type="submit" class="btn btn-xs btn-outline-primary" title="Resend to recipients">
+                    <i class="fas fa-paper-plane"></i>
+                  </button>
+                </form>
+                {% else %}
+                <span class="btn btn-xs btn-outline-secondary btn-ghost" aria-hidden="true"><i class="fas fa-file-pdf"></i></span>
+                <span class="btn btn-xs btn-outline-primary btn-ghost" aria-hidden="true"><i class="fas fa-paper-plane"></i></span>
+                {% endif %}
+              </span>
+              <span class="vr"></span>
+              <span class="d-inline-flex flex-nowrap gap-1">
+                {% if t.status == 'Published' %}
+                <span class="btn btn-xs btn-outline-secondary btn-ghost" aria-hidden="true"><i class="fas fa-pen"></i></span>
+                <span class="btn btn-xs btn-outline-danger btn-ghost" aria-hidden="true"><i class="fas fa-trash"></i></span>
+                {% else %}
+                <a href="{{ url_for('threat_actor_profile.edit', id=t.uuid) }}" class="btn btn-xs btn-outline-secondary" title="Edit">
+                  <i class="fas fa-pen"></i>
+                </a>
+                <form method="post" action="{{ url_for('threat_actor_profile.delete', id=t.uuid) }}" data-busy="Deleting…"
+                      class="d-inline" data-submit-confirm="Delete {{ t.tap_id }}?">
+                  <button class="btn btn-xs btn-outline-danger" title="Delete">
+                    <i class="fas fa-trash"></i>
+                  </button>
+                </form>
+                {% endif %}
+              </span>
+            </div>
+          </td>
+        </tr>
+
+        {# ── Expandable preview row ── #}
+        <tr id="tap-preview-{{ t.uuid }}" style="display:none;">
+          <td colspan="7" class="p-0">
+            <div style="background:var(--surface-muted);border-top:1px solid var(--border-light);padding:1rem 1.25rem;">
+              <div class="d-flex align-items-center gap-3 mb-3">
+                <span class="req-id-badge">{{ t.tap_id }}</span>
+                <span class="tlp-badge tlp-{{ t.tlp | slug }}">TLP:{{ t.tlp | upper }}</span>
+                {% if t.audience %}<span class="text-muted small">{{ t.audience }}</span>{% endif %}
+                {% if t.author %}<span class="text-muted small">by {{ t.author }}</span>{% endif %}
+                {% if t.assessment_confidence %}<span class="text-muted small">· {{ t.assessment_confidence | capitalize }} confidence</span>{% endif %}
+                <div class="d-flex align-items-center gap-2 ms-auto">
+                {% if t.status == 'Draft' %}
+                {{ approval_form(url_for('threat_actor_profile.publish', id=t.uuid), can_publish, (t.audience or '') | trim) }}
+                {% endif %}
+                <button type="button" class="btn btn-xs btn-outline-secondary"
+                        data-recipients-url="{{ url_for('threat_actor_profile.recipients_fragment', id=t.uuid) }}"
+                        title="Preview recipients">
+                  <i class="fas fa-users me-1"></i>Recipients
+                </button>
+                </div>
+              </div>
+              {% if t.summary %}
+              <div class="mb-3">
+                <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Summary</div>
+                <div class="report-md-body" style="font-size:.88rem;" data-md="{{ t.summary | e }}"></div>
+              </div>
+              {% endif %}
+              {% if t.actor_types or t.suspected_origin or t.motivation %}
+              <p class="mb-2" style="font-size:.82rem;">
+                {% if t.actor_types %}<strong>Type:</strong> {{ t.actor_types | join(', ') }}{% endif %}
+                {% if t.suspected_origin %} · <strong>Origin:</strong> {{ t.suspected_origin }}{% endif %}
+                {% if t.motivation %} · <strong>Motivation:</strong> {{ t.motivation }}{% endif %}
+              </p>
+              {% endif %}
+              {% if t.geographic_scope or t.sectors or t.mitre_attack_techniques %}
+              <div class="d-flex flex-wrap gap-1">
+                {% for x in t.geographic_scope %}<span class="badge chip-source">{{ x }}</span>{% endfor %}
+                {% for x in t.sectors %}<span class="badge chip-source">{{ x }}</span>{% endfor %}
+                {% for x in t.mitre_attack_techniques %}<span class="badge chip-source">{{ x }}</span>{% endfor %}
+              </div>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      {% endif %}
+      {% endfor %}
+    </table>
+    </div>
+    {% elif filtered %}
+    <div class="p-4 text-center text-muted">No threat actor profiles match these filters.</div>
+    {% else %}
+    <div class="p-4 text-center text-muted">
+      No threat actor profiles yet. <a href="{{ url_for('threat_actor_profile.new') }}">Create the first one</a>.
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+{# ── Inline feedback modal ── #}
+<div class="modal fade" id="feedback-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title">
+          <i class="fas fa-comment-dots me-2"></i>Feedback - <span id="feedback-product-id"></span>
+        </h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form id="feedback-form" method="post" action="">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="modal-body">
+          <div class="mb-3">
+            <label class="form-label small">Your name <span class="text-muted">(optional)</span></label>
+            <input type="text" name="author" class="form-control form-control-sm" placeholder="Name">
+          </div>
+          <div class="mb-3">
+            <label class="form-label small">Rating</label>
+            <select name="rating" class="form-select form-select-sm">
+              <option value="">- select rating -</option>
+              <option value="Very useful">Very useful</option>
+              <option value="Useful">Useful</option>
+              <option value="Somewhat useful">Somewhat useful</option>
+              <option value="Not useful">Not useful</option>
+            </select>
+          </div>
+          <div class="mb-2">
+            <label class="form-label small">Comments or suggestions</label>
+            <textarea name="comment" class="form-control form-control-sm" rows="4"
+                      placeholder="New campaigns, TTPs, infrastructure, corrections…"></textarea>
+          </div>
+        </div>
+        <div class="modal-footer py-2">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-sm btn-primary"><i class="fas fa-paper-plane me-1"></i>Submit</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% include "_recipients_modal.html" %}
+{% endblock %}
+
+{% block scripts %}
+{% include "_markdown_js.html" %}
+<script>
+(function() {
+  document.querySelectorAll('.preview-toggle-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var row = document.getElementById(btn.getAttribute('data-target'));
+      if (!row) return;
+      var open = row.style.display !== 'none';
+      row.style.display = open ? 'none' : '';
+      btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+      var icon = btn.querySelector('i');
+      if (icon) icon.className = 'fas fa-fw ' + (open ? btn.dataset.previewIcon : 'fa-eye-slash');
+      if (!open) {
+        row.querySelectorAll('.report-md-body[data-md]').forEach(function(el) {
+          zsazsaRenderMarkdown(el, el.getAttribute('data-md'));
+          el.removeAttribute('data-md');
+        });
+      }
+    });
+  });
+
+  var feedbackModal = document.getElementById('feedback-modal');
+  if (feedbackModal) {
+    feedbackModal.addEventListener('show.bs.modal', function(e) {
+      var trigger = e.relatedTarget;
+      if (!trigger) return;
+      document.getElementById('feedback-product-id').textContent = trigger.getAttribute('data-tap-id') || '';
+      document.getElementById('feedback-form').action = trigger.dataset.action;
+    });
+    feedbackModal.addEventListener('hidden.bs.modal', function() {
+      feedbackModal.querySelector('form').reset();
+    });
+  }
+})();
+</script>
+{% endblock %}

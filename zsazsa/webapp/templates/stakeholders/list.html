@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% from "_sort.html" import sort_th %}
+
+{% block title %}Stakeholders | zsazsa CTI{% endblock %}
+{% block page_title %}Stakeholders{% endblock %}
+
+{% block content %}
+<style>
+  /* Internal and external are figures in the banner that filter the list. */
+  .stakeholder-type { white-space: nowrap; }
+  .stakeholder-type:hover b, .stakeholder-type.selected b { text-decoration: underline; }
+  .stakeholder-type.faded, .subscription.faded { opacity: .45; }
+  .record-hero-compact .list-stats .subscription-mix { flex-grow: 1.7; }
+  /* A product is a chip, filled as far as its share of the most subscribed. */
+  .subscriptions { display: flex; flex-wrap: wrap; gap: .25rem; }
+  .subscription { display: inline-flex; align-items: center; gap: .35rem; max-width: 100%; padding: .05rem .5rem;
+    border: 1px solid var(--border-light); border-radius: 999px; color: inherit; text-decoration: none; font-size: .7rem;
+    background: linear-gradient(90deg, color-mix(in srgb, var(--accent-orange) 22%, transparent) var(--share), transparent var(--share)); }
+  .subscription:hover, .subscription.selected { border-color: var(--accent-orange); }
+  .subscription.selected .name { font-weight: 600; text-decoration: underline; }
+  .subscription .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .subscription .n { font-weight: 600; }
+
+  .stakeholder-filters .clear { margin-left: auto; }
+  .stakeholder-table td { padding-top: .75rem; padding-bottom: .75rem; }
+  .stakeholder-table .who { display: flex; align-items: center; gap: .75rem; }
+  .stakeholder-table .name { font-weight: 600; text-decoration: none; }
+  .product-ticks { display: flex; gap: 2px; margin-bottom: .2rem; }
+  .product-ticks i { width: .65rem; height: .35rem; border-radius: 2px; background: var(--border-light); }
+  .product-ticks i.on { background: var(--accent-blue); }
+</style>
+{% import "_charts.html" as charts with context %}
+{% set totals = namespace(red=0, uncovered=0) %}
+{% for s in stakeholders %}
+  {% if s.tlp_clearance | lower == 'red' %}{% set totals.red = totals.red + 1 %}{% endif %}
+  {% set pirs, girs = requirement_counts[s.uuid] %}
+  {% if not (pirs | sum or girs | sum) %}{% set totals.uncovered = totals.uncovered + 1 %}{% endif %}
+{% endfor %}
+
+<section class="record-hero record-hero-compact rise mb-3">
+  <div class="hero-main">
+    <span class="hero-icon" aria-hidden="true"><i class="fas fa-people-group"></i></span>
+    <div class="record-kpis">
+      <div class="record-kpi"><b>{{ stakeholders | length }}</b><span>stakeholder{{ 's' if stakeholders | length != 1 }}{{ ' shown' if type_filter or org_filter or role_filter or product_filter }}</span></div>
+      {% if type_counts %}
+      {% for kind in ('Internal', 'External') %}
+      <a href="{{ charts.filtered_url('type', kind, type_filter) }}"
+         class="record-kpi stakeholder-type{{ ' selected' if type_filter == kind }}{{ ' faded' if type_filter and type_filter != kind }}"
+         title="{{ 'Show all again' if type_filter == kind else 'Show only ' ~ kind | lower ~ ' stakeholders' }}">
+        <b>{{ type_counts[kind] }}</b><span><i class="fas fa-{{ 'building' if kind == 'Internal' else 'globe' }} me-1"></i>{{ kind }}</span>
+      </a>
+      {% endfor %}
+      {% endif %}
+      <div class="record-kpi"><b>{{ unsubscribed }}</b><span>without a subscription</span></div>
+      <div class="record-kpi"><b>{{ totals.red }}</b><span>cleared for TLP:RED</span></div>
+      <div class="record-kpi{{ ' warn' if totals.uncovered }}"><b>{{ totals.uncovered }}</b><span>with no PIR or GIR</span></div>
+    </div>
+    <div class="hero-actions">
+      <a href="{{ url_for('stakeholders.new') }}" class="btn btn-sm btn-hero"><i class="fas fa-plus me-1"></i> Add stakeholder</a>
+      <a href="{{ url_for('stakeholders.matrix') }}" class="btn btn-sm btn-hero-ghost"><i class="fas fa-table-cells me-1"></i> Stakeholder matrix</a>
+      <a href="{{ url_for('export.stakeholders') }}" class="btn btn-sm btn-hero-ghost" title="Export as Markdown"><i class="fas fa-download me-1"></i> Export</a>
+    </div>
+  </div>
+
+  {% if role_counts or subscription_counts %}
+  <div class="record-panel list-stats">
+    <div>{{ charts.mix('Roles', role_counts, param='role', selected=role_filter) }}</div>
+    <div class="subscription-mix">
+      <div class="d-flex justify-content-between align-items-baseline mb-1">
+        <span class="chart-label">Product subscriptions</span>
+        {% if unsubscribed %}<span class="text-muted" style="font-size:.72rem;">{{ unsubscribed }} without any</span>{% endif %}
+      </div>
+      {% if subscription_counts %}
+      {% set most = subscription_counts[0][1] %}
+      <div class="subscriptions">
+        {% for product, n in subscription_counts %}
+        <a href="{{ charts.filtered_url('product', product, product_filter) }}"
+           class="subscription{{ ' selected' if product_filter == product }}{{ ' faded' if product_filter and product_filter != product }}"
+           style="--share:{{ (n / most * 100) | round(1) }}%;"
+           title="{{ 'Show all again' if product_filter == product else 'Show only the subscribers to ' ~ product }}">
+          <span class="name">{{ product }}</span>
+          <span class="n">{{ n }}</span>
+        </a>
+        {% endfor %}
+      </div>
+      {% else %}
+      <span class="text-muted small">-</span>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+</section>
+
+<form method="get" class="card content-card list-filters record-filters stakeholder-filters rise rise-1 mb-4">
+  {{ charts.filter_select('type', 'Type', 'fa-circle-half-stroke', 'All types', ['Internal', 'External'], type_filter) }}
+  {{ charts.filter_select('organization', 'Organisation', 'fa-sitemap', 'All organisations', org_options, org_filter) }}
+  {{ charts.filter_select('role', 'Role', 'fa-user-tag', 'All roles', role_options, role_filter) }}
+  {{ charts.filter_select('product', 'Product subscription', 'fa-cubes', 'All subscriptions', product_options, product_filter) }}
+  {% if type_filter or org_filter or role_filter or product_filter %}
+  <a href="{{ url_for('stakeholders.list') }}" class="btn btn-xs btn-outline-secondary clear">Clear</a>
+  {% endif %}
+</form>
+
+<div class="card content-card rise rise-2">
+  <div class="card-body p-0">
+    {% if stakeholders %}
+    <div class="table-responsive">
+    <table class="table table-hover zsazsa-table stakeholder-table mb-0">
+      <thead>
+        <tr>
+          {{ sort_th('Name', 'name') }}
+          {{ sort_th('Role', 'role') }}
+          <th>Organisation</th>
+          <th>TLP clearance</th>
+          <th>Products</th>
+          <th title="PIRs it owns / PIRs with it in their distribution">PIR</th>
+          <th title="GIRs it owns / GIRs with it in their distribution">GIR</th>
+          <th class="text-end">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in stakeholders %}
+        {% set external = s.stakeholder_type != 'Internal' %}
+        <tr>
+          <td>
+            <div class="who">
+              <span class="monogram{{ ' external' if external }}" aria-hidden="true">{{ s.name[:1] | upper }}</span>
+              <div>
+                <a href="{{ url_for('stakeholders.detail', id=s.id) }}" class="name">{{ s.name }}</a>
+                {% if external %}<i class="fas fa-globe ms-1 stakeholder-external" title="External" aria-label="External"></i>
+                {% else %}<i class="fas fa-building ms-1 stakeholder-internal" title="Internal" aria-label="Internal"></i>{% endif %}
+                {% if s.email %}<div class="text-muted small">{{ s.email }}</div>{% endif %}
+              </div>
+            </div>
+          </td>
+          <td><span class="text-muted">{{ s.role or '-' }}</span></td>
+          <td>{{ org_map.get(s.organization, s.organization) or '-' }}</td>
+          <td><span class="tlp-badge tlp-{{ s.tlp_clearance | slug }}">TLP:{{ s.tlp_clearance | upper }}</span></td>
+          <td>
+            {% set products = subscribed_products(s) %}
+            {% if products %}
+            <div class="product-ticks" aria-hidden="true">
+              {% for _ in product_types %}<i class="{{ 'on' if loop.index <= products | length }}"></i>{% endfor %}
+            </div>
+            <span class="text-muted small">{{ products | length }} product{{ 's' if products | length != 1 }}</span>
+            {% else %}
+            <span class="text-muted">-</span>
+            {% endif %}
+          </td>
+          {% for owned, listed in requirement_counts[s.uuid] %}
+          <td><span class="small {{ 'text-danger' if not owned and not listed else 'text-muted' }}"
+                    title="{{ owned }} owned; {{ listed }} in distribution">{{ owned }}/{{ listed }}</span></td>
+          {% endfor %}
+          <td class="text-end">
+            <a href="{{ url_for('stakeholders.edit', id=s.id) }}" class="btn btn-xs btn-outline-secondary me-1" title="Edit">
+              <i class="fas fa-pen"></i>
+            </a>
+            {% if s.uuid in owned_records %}
+            <span title="Cannot be deleted while it owns {{ owned_records[s.uuid] | join(', ') }}. Give them another owner or delete them first."
+                  style="cursor:not-allowed;" class="d-inline-block">
+              <button class="btn btn-xs btn-outline-danger" disabled style="pointer-events:none;">
+                <i class="fas fa-trash"></i>
+              </button>
+            </span>
+            {% else %}
+            <form method="post" action="{{ url_for('stakeholders.delete', id=s.id) }}" class="d-inline" data-submit-confirm="Delete {{ s.name }}?">
+              <button class="btn btn-xs btn-outline-danger" title="Delete">
+                <i class="fas fa-trash"></i>
+              </button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <div class="empty-state py-5">
+      <i class="fas fa-users fa-2x text-muted mb-3 d-block"></i>
+      <p class="text-muted mb-3">{{ 'No stakeholder matches these filters.' if type_filter or org_filter or role_filter or product_filter else 'No stakeholders yet.' }}</p>
+      <a href="{{ url_for('stakeholders.new') }}" class="btn btn-primary btn-sm">
+        <i class="fas fa-plus me-1"></i> Add a stakeholder
+      </a>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

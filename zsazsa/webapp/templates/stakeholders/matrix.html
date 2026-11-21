@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+
+{% block title %}Stakeholder matrix | zsazsa CTI{% endblock %}
+{% block page_title %}Stakeholder matrix{% endblock %}
+
+{# Each quadrant's name, colour, icon and how to engage the stakeholders in it. #}
+{% set looks = {
+  'manage-closely': ('Manage closely', 'var(--accent-blue)', 'fa-handshake',
+                     "Shapes the program's direction and acts on what it receives. Regular briefings, a hand in setting the priority intelligence requirements, and quick answers to their questions."),
+  'keep-satisfied': ('Keep satisfied', 'var(--accent-orange)', 'fa-face-smile',
+                     'Can change the program even when it rarely engages with its output. Periodic summaries, and no surprises.'),
+  'keep-informed':  ('Keep informed', 'var(--accent-green)', 'fa-envelope-open-text',
+                     'Relies on the intelligence with little say over the program. In the distribution lists of the products it cares about, and asked for feedback.'),
+  'monitor':        ('Monitor', 'var(--neutral-600)', 'fa-eye',
+                     'Low influence and low interest. Watch for a change in role or priorities that moves it to another quadrant.'),
+} %}
+
+{% macro mark(s) -%}
+{%- set words = (s.name or '?').split() -%}
+<span class="pim-mark{{ ' external' if s.stakeholder_type != 'Internal' }}" aria-hidden="true">{{ (words[0][:1] ~ (words[1][:1] if words | length > 1 else words[0][1:2])) | upper }}</span>
+{%- endmacro %}
+
+{% block content %}
+{% import "_charts.html" as charts with context %}
+{% set internal = stakeholders | selectattr('stakeholder_type', 'equalto', 'Internal') | list | length %}
+{% set quadrant_counts = [] %}{% set quadrant_colors = {} %}
+{% for key, (label, color, icon, hint) in looks.items() %}
+  {% set _ = quadrant_counts.append((label, by_quadrant[key] | length)) %}{% set _ = quadrant_colors.update({label: color}) %}
+{% endfor %}
+<section class="record-hero record-hero-compact rise mb-3">
+  <div class="hero-main">
+    <span class="hero-icon" aria-hidden="true"><i class="fas fa-table-cells-large"></i></span>
+    <p class="lead-text">Where each stakeholder stands by influence over the program and interest in its intelligence, and so how to engage them. Revisit it as roles and priorities change.</p>
+    <div class="record-kpis">
+      <div class="record-kpi"><b>{{ stakeholders | length }}</b><span>stakeholder{{ 's' if stakeholders | length != 1 }}</span></div>
+      {% for key, (label, color, icon, hint) in looks.items() %}
+      <div class="record-kpi"><b>{{ by_quadrant[key] | length }}</b><span>to {{ label | lower }}</span></div>
+      {% endfor %}
+    </div>
+    <div class="hero-actions">
+      <a href="{{ url_for('stakeholders.new') }}" class="btn btn-sm btn-hero"><i class="fas fa-plus me-1"></i> Add stakeholder</a>
+      <a href="{{ url_for('stakeholders.list') }}" class="btn btn-sm btn-hero-ghost"><i class="fas fa-list me-1"></i> All stakeholders</a>
+    </div>
+  </div>
+  {% if stakeholders %}
+  <div class="record-panel list-stats">
+    <div style="flex-grow:1.6;">{{ charts.mix('Quadrant', quadrant_counts | selectattr(1) | list, quadrant_colors) }}</div>
+    <div>{{ charts.mix('Internal or external', [('internal', internal), ('external', stakeholders | length - internal)] | selectattr(1) | list,
+                       {'internal': 'var(--accent-blue)', 'external': 'var(--neutral-400)'}) }}</div>
+  </div>
+  {% endif %}
+</section>
+
+{% if stakeholders %}
+<div class="row g-4">
+
+  <div class="col-lg-8">
+    <div class="card content-card rise rise-1">
+      <div class="card-header d-flex align-items-center justify-content-between gap-2">
+        <span><i class="fas fa-table-cells-large me-2"></i>Power and interest</span>
+        <span class="small text-muted fw-normal">
+          <span class="legend-mark" style="background:var(--misp-navy);"></span>internal
+          <span class="legend-mark ms-2" style="box-shadow:inset 0 0 0 2px var(--misp-navy);"></span>external
+        </span>
+      </div>
+      <div class="card-body">
+        <div class="pim">
+          <div class="pim-names">
+            {% for key in ('keep-satisfied', 'manage-closely') %}{% set label, color, icon, hint = looks[key] %}
+            <span class="pim-name" style="--q:{{ color }};"><i class="fas {{ icon }}" aria-hidden="true"></i>{{ label }}<b>{{ by_quadrant[key] | length }}</b></span>
+            {% endfor %}
+          </div>
+          <div class="pim-y">Influence <small>&nbsp;low to high</small></div>
+          <div class="pim-field">
+            {% for key in ('keep-satisfied', 'manage-closely', 'monitor', 'keep-informed') %}
+            <div class="pim-q" style="--q:{{ looks[key][1] }};"></div>
+            {% endfor %}
+            {% for s in stakeholders %}
+            <a href="{{ url_for('stakeholders.detail', id=s.id) }}" class="pim-dot{{ ' flip' if s.interest_pct > 70 }}"
+               data-stakeholder="{{ s.id }}" style="--q:{{ looks[s.quadrant_key][1] }};left:{{ s.interest_pct }}%;bottom:{{ s.influence_pct }}%;"
+               title="{{ s.name }}: influence {{ s.influence }}/10, interest {{ s.interest }}/10">
+              {{ mark(s) }}<span class="label">{{ s.name | truncate(22, True, '…') }}</span>
+            </a>
+            {% endfor %}
+          </div>
+          <div class="pim-names">
+            {% for key in ('monitor', 'keep-informed') %}{% set label, color, icon, hint = looks[key] %}
+            <span class="pim-name" style="--q:{{ color }};"><i class="fas {{ icon }}" aria-hidden="true"></i>{{ label }}<b>{{ by_quadrant[key] | length }}</b></span>
+            {% endfor %}
+          </div>
+          <div class="pim-x"><small>low</small><span>Interest in the intelligence</span><small>high</small></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-4">
+    <div class="d-flex flex-column gap-3">
+      {% for key, (label, color, icon, hint) in looks.items() %}
+      <div class="card content-card quad-card" style="--q:{{ color }};">
+        <div class="card-header d-flex align-items-center justify-content-between">
+          <span><i class="fas {{ icon }} me-2" aria-hidden="true"></i>{{ label }}</span><b>{{ by_quadrant[key] | length }}</b>
+        </div>
+        <div class="card-body py-2">
+          <p class="small text-muted mb-2">{{ hint }}</p>
+          {% if by_quadrant[key] %}
+          <ul class="quad-list">
+            {% for s in by_quadrant[key] %}
+            <li data-stakeholder="{{ s.id }}">
+              {{ mark(s) }}
+              <span class="min-w-0">
+                <a href="{{ url_for('stakeholders.detail', id=s.id) }}" class="d-block text-truncate fw-semibold text-decoration-none">{{ s.name }}</a>
+                <span class="small text-muted">{{ s.role or 'No role set' }} · {{ s.stakeholder_type | lower }}</span>
+              </span>
+              <span class="scores" title="Influence and interest, out of 10">{{ s.influence }} · {{ s.interest }}</span>
+            </li>
+            {% endfor %}
+          </ul>
+          {% else %}
+          <p class="text-muted small mb-1">No stakeholders here yet.</p>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+</div>
+{% else %}
+<div class="card content-card">
+  <div class="card-body empty-state py-5">
+    <i class="fas fa-users fa-2x text-muted mb-3 d-block"></i>
+    <p class="text-muted mb-3">No stakeholders yet. Add stakeholders and set their influence and interest to plot them here.</p>
+    <a href="{{ url_for('stakeholders.new') }}" class="btn btn-primary btn-sm">
+      <i class="fas fa-plus me-1"></i> Add first stakeholder
+    </a>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  // Hovering a name in a quadrant's list points out its mark on the matrix.
+  document.querySelectorAll('li[data-stakeholder]').forEach(function(item) {
+    var dot = document.querySelector('.pim-dot[data-stakeholder="' + item.dataset.stakeholder + '"]');
+    if (!dot) return;
+    item.addEventListener('mouseenter', function() { dot.classList.add('is-highlighted'); });
+    item.addEventListener('mouseleave', function() { dot.classList.remove('is-highlighted'); });
+  });
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,393 @@
+{% extends "base.html" %}
+{% from "_product_actions.html" import preview_button, approval_form, review_checks, delete_rejected_form, read_again_note,
+    select_all_th, select_cell, selection_toolbar with context %}
+{% from "_macros.html" import audience_badges %}
+{% from "_sort_header.html" import sort_th with context %}
+
+{% block title %}Vulnerability advisories | zsazsa CTI{% endblock %}
+{% block page_title %}Vulnerability advisories{% endblock %}
+
+{# Short fields are Markdown and render server-side, as they do on the detail
+   page. Prose (the summary) goes through report-md-body instead, so it is
+   sanitised client-side. #}
+{% macro bullets(items) %}
+  {% if items %}<ul class="mb-0 ps-3">{% for i in items %}<li style="font-size:.82rem;">{{ i | md_inline }}</li>{% endfor %}</ul>
+  {% else %}<span class="text-muted" style="font-size:.82rem;">none recorded</span>{% endif %}
+{% endmacro %}
+
+{% block content %}
+{% import "_charts.html" as charts with context %}
+{% set exploitation_colors = {'Active': 'var(--accent-red)', 'KEV listed': 'var(--accent-orange)',
+                              'Weaponised': 'var(--priority-must-fg)', 'PoC public': 'var(--priority-should-fg)',
+                              'None known': 'var(--accent-green)', 'Unknown': 'var(--neutral-400)'} %}
+{% set count = namespace(waiting=0, draft=0, approved=0, rejected=0, kev=0) %}
+{% for v in veas %}
+  {% if v.review_state == 'pending-review' %}{% set count.waiting = count.waiting + 1 %}
+  {% elif v.review_state == 'draft' %}{% set count.draft = count.draft + 1 %}
+  {% elif v.review_state == 'approved' %}{% set count.approved = count.approved + 1 %}
+  {% elif v.review_state == 'rejected' %}{% set count.rejected = count.rejected + 1 %}{% endif %}
+  {% if exploitation[v.uuid] == 'KEV listed' %}{% set count.kev = count.kev + 1 %}{% endif %}
+{% endfor %}
+{% set published_dates = veas | selectattr('published_at') | map(attribute='published_at') | list %}
+{% set filtered = state_filter or exploitation_filter or tlp_filter or audience_filter %}
+
+<section class="record-hero record-hero-compact rise mb-3">
+  <div class="hero-main">
+    <span class="hero-icon" aria-hidden="true"><i class="fas fa-bug"></i></span>
+    <div class="record-kpis">
+      <div class="record-kpi"><b>{{ veas | length }}</b><span>advisor{{ 'ies' if veas | length != 1 else 'y' }}{{ ' shown' if filtered }}</span></div>
+      <a href="{{ charts.filtered_url('state', 'pending-review', state_filter) }}" class="record-kpi{{ ' warn' if count.waiting }}"
+         title="{{ 'Show all again' if state_filter == 'pending-review' else 'Show only those waiting for review' }}"><b>{{ count.waiting }}</b><span>waiting for review</span></a>
+      {% if count.draft %}<div class="record-kpi"><b>{{ count.draft }}</b><span>draft{{ 's' if count.draft != 1 }}</span></div>{% endif %}
+      <div class="record-kpi"><b>{{ count.approved }}</b><span>approved</span></div>
+      <div class="record-kpi"><b>{{ count.rejected }}</b><span>rejected</span></div>
+      <a href="{{ charts.filtered_url('exploitation', 'KEV listed', exploitation_filter) }}" class="record-kpi{{ ' warn' if count.kev }}"
+         title="{{ 'Show all again' if exploitation_filter == 'KEV listed' else 'Show only those on the CISA KEV list' }}"><b>{{ count.kev }}</b><span>KEV listed</span></a>
+      {% if published_dates %}<div class="record-kpi"><b>{{ (published_dates | max).strftime('%d-%m') }}</b><span>last published</span></div>{% endif %}
+    </div>
+    <div class="hero-actions">
+      <a href="{{ url_for('vea.wizard_new') }}" class="btn btn-sm btn-hero"><i class="fas fa-plus me-1"></i> New advisory</a>
+      <button type="button" class="btn btn-sm btn-hero-ghost" data-bs-toggle="collapse" data-bs-target="#product-flow"
+              aria-expanded="false" aria-controls="product-flow">
+        <i class="fas fa-circle-question me-1"></i> How a vulnerability advisory is made
+      </button>
+    </div>
+  </div>
+  {% if state_counts or exploitation_counts or tlp_counts or audience_counts %}
+  <div class="record-panel list-stats">
+    <div>{{ charts.mix('Review state', state_counts, charts.review_colors, param='state', selected=state_filter) }}</div>
+    <div>{{ charts.mix('Exploitation', exploitation_counts, exploitation_colors, param='exploitation', selected=exploitation_filter) }}</div>
+    <div>{{ charts.mix('TLP', tlp_counts, charts.tlp_colors, param='tlp', selected=tlp_filter) }}</div>
+    <div style="flex-grow:2.2;">{{ charts.mix('Audience', audience_counts, param='audience', selected=audience_filter, top=4) }}</div>
+  </div>
+  {% endif %}
+</section>
+
+<form method="get" class="card content-card list-filters record-filters rise rise-1 mb-4">
+  {{ charts.filter_select('state', 'Review state', 'fa-list-check', 'All states', review_states, state_filter) }}
+  {{ charts.filter_select('exploitation', 'Exploitation', 'fa-bug', 'Any exploitation', exploitation_choices, exploitation_filter) }}
+  {{ charts.filter_select('tlp', 'TLP', 'fa-traffic-light', 'All TLP levels', tlp_choices, tlp_filter) }}
+  {{ charts.filter_select('audience', 'Audience', 'fa-users', 'All audiences', audience_choices, audience_filter) }}
+  {% if filtered %}
+  <a href="{{ url_for('vea.review') }}" class="btn btn-xs btn-outline-secondary ms-auto">Clear</a>
+  {% endif %}
+</form>
+
+{% include "vea/_flow.html" %}
+
+{% set lanes = [('pending-review', 'Waiting for review', 'Approve and publish, or reject', 'var(--accent-blue)'),
+                ('draft', 'Draft', 'Submit for review when it is ready', 'var(--neutral-500)'),
+                ('approved', 'Approved', 'Sent to their audience', 'var(--accent-green)'),
+                ('rejected', 'Rejected', 'Kept until deleted', 'var(--accent-red)')] %}
+{% set steps = {'draft': ['now', '', ''], 'pending-review': ['done', 'now', ''], 'approved': ['done', 'done', 'now'],
+                'rejected': ['done', 'done', '']} %}
+<div class="card content-card rise rise-2">
+  <div class="card-body p-0">
+    {% if veas %}
+    <div class="table-responsive">
+    <table class="table table-hover zsazsa-table req-table product-table mb-0">
+      <thead>
+        <tr>
+          {{ select_all_th() }}
+          {{ sort_th('VEA', 'id', sort, dir, 'vea.review', '120px') }}
+          {{ sort_th('CVE', 'cve', sort, dir, 'vea.review', '130px') }}
+          {{ sort_th('Title', 'title', sort, dir, 'vea.review') }}
+          <th>TLP</th>
+          <th>Exploitation</th>
+          {{ sort_th('State', 'state', sort, dir, 'vea.review') }}
+          {{ sort_th('Published', 'date', sort, dir, 'vea.review') }}
+          <th class="text-end">
+            {% call selection_toolbar(url_for('vea.selected'), can_publish) %}{{ delete_rejected_form(url_for('vea.delete_rejected'), rejected_count) }}{% endcall %}
+          </th>
+        </tr>
+      </thead>
+      {% for state, lane, hint, color in lanes %}
+      {# A state none of the lanes has, set by hand in MISP, is shown as a draft rather than not at all. #}
+      {% set others = lanes | map(attribute=0) | reject('equalto', 'draft') | list %}
+      {% set rows = (veas | selectattr('review_state', 'equalto', state) | list) if state != 'draft'
+                     else (veas | rejectattr('review_state', 'in', others) | list) %}
+      {% if rows %}
+      <tbody>
+        <tr class="lane-head">
+          <th colspan="9">
+            <span class="lane-mark" style="background:{{ color }};"></span>
+            <span class="lane-name">{{ lane }}</span>
+            <span class="lane-count">{{ rows | length }} advisor{{ 'ies' if rows | length != 1 else 'y' }}</span>
+            <span class="lane-hint">{{ hint }}</span>
+          </th>
+        </tr>
+        {% for v in rows %}
+        {# ── Main row ── #}
+        <tr id="vea-row-{{ v.uuid }}" class="{{ 'draft-row' if state == 'pending-review' }}">
+          {{ select_cell(v.uuid, v.vea_id, v.review_state in ('draft', 'pending-review')) }}
+          <td style="white-space:nowrap;">
+            <a href="{{ url_for('vea.detail', id=v.uuid) }}" class="text-decoration-none">
+              <span class="req-id-badge">{{ v.vea_id }}</span>
+            </a>
+          </td>
+          <td><code class="small" style="white-space:nowrap;">{{ v.cve_id or '-' }}</code></td>
+          <td>
+            <a href="{{ url_for('vea.detail', id=v.uuid) }}" class="title{{ ' untitled' if not (v.title or v.cve_id) }}">{{ v.title or v.cve_id or 'No title' }}</a>
+            {% if v.created_at %}<span class="made-on" title="Made on {{ v.created_at.strftime('%Y-%m-%d') }}">{{ v.created_at.strftime('%Y-%m-%d') }}</span>{% endif %}
+            {{ audience_badges(v.audience, limit=3) }}
+            {% if v.analyser_reason %}<div class="small text-muted">{{ v.analyser_reason | md_inline }}</div>{% endif %}
+          </td>
+          <td><span class="tlp-badge tlp-{{ v.tlp | slug }}">TLP:{{ v.tlp | upper }}</span></td>
+          <td>
+            {% if exploitation[v.uuid] == 'Active' %}
+              <span class="badge bg-danger">Active</span>
+            {% elif exploitation[v.uuid] == 'KEV listed' %}
+              <span class="badge bg-warning text-dark">KEV listed</span>
+            {% else %}
+              <span class="text-muted small">{{ exploitation[v.uuid] }}</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="status-steps" aria-hidden="true" style="max-width:6rem;">
+              {% for step in steps[state] %}<i class="{{ step }}"></i>{% endfor %}
+            </div>
+            {% if v.review_state == 'approved' %}<span class="badge bg-success">approved</span>
+            {% elif v.review_state == 'rejected' %}<span class="badge bg-danger">rejected</span>
+            {% elif v.review_state == 'pending-review' %}<span class="badge bg-info text-dark">pending review</span>
+            {% else %}<span class="badge bg-secondary">{{ v.review_state }}</span>{% endif %}
+          </td>
+          <td style="white-space:nowrap;">{{ v.published_at.strftime('%Y-%m-%d') if v.published_at else '-' }}</td>
+          <td class="text-end">
+            <div class="d-inline-flex flex-nowrap align-items-center justify-content-end gap-2">
+              <span class="d-inline-flex flex-nowrap gap-1">
+                {{ preview_button('vea-preview-' ~ v.uuid, v.review_state in ('draft', 'pending-review')) }}
+                <button type="button" class="btn btn-xs btn-outline-secondary feedback-btn"
+                        data-action="{{ url_for('vea.add_feedback', id=v.uuid) }}" data-vea-id="{{ v.vea_id }}"
+                        data-bs-toggle="modal" data-bs-target="#feedback-modal" title="Give feedback">
+                  <i class="fas fa-comment-dots"></i>
+                </button>
+                <a href="{{ url_for('vea.pdf', id=v.uuid) }}" class="btn btn-xs btn-outline-secondary" title="Download PDF">
+                  <i class="fas fa-file-pdf"></i>
+                </a>
+                {% if v.review_state == 'approved' %}
+                <form method="post" action="{{ url_for('vea.resend', id=v.uuid) }}" class="d-inline">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <button type="submit" class="btn btn-xs btn-outline-primary" title="Resend to stakeholders">
+                    <i class="fas fa-paper-plane"></i>
+                  </button>
+                </form>
+                {% else %}
+                <span class="btn btn-xs btn-outline-primary btn-ghost" aria-hidden="true"><i class="fas fa-paper-plane"></i></span>
+                {% endif %}
+              </span>
+              <span class="vr"></span>
+              <span class="d-inline-flex flex-nowrap gap-1">
+                {% if v.review_state == 'approved' %}
+                <span class="btn btn-xs btn-outline-secondary btn-ghost" aria-hidden="true"><i class="fas fa-pen"></i></span>
+                <span class="btn btn-xs btn-outline-danger btn-ghost" aria-hidden="true"><i class="fas fa-trash"></i></span>
+                {% else %}
+                <a href="{{ url_for('vea.wizard_edit', id=v.uuid) }}" class="btn btn-xs btn-outline-secondary" title="Edit">
+                  <i class="fas fa-pen"></i>
+                </a>
+                <form method="post" action="{{ url_for('vea.delete', id=v.uuid) }}" data-busy="Deleting…"
+                      class="d-inline"
+                      data-submit-confirm="Delete {{ v.vea_id }}?{{ read_again_note(v.review_state) }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <button type="submit" class="btn btn-xs btn-outline-danger" title="Delete advisory">
+                    <i class="fas fa-trash"></i>
+                  </button>
+                </form>
+                {% endif %}
+              </span>
+            </div>
+          </td>
+        </tr>
+
+        {# ── Expandable preview row ── #}
+        <tr id="vea-preview-{{ v.uuid }}" style="display:none;">
+          <td colspan="9" class="p-0">
+            <div class="qa-review-block" style="background:var(--surface-muted);border-top:1px solid var(--border-light);padding:1rem 1.25rem;">
+
+              <div class="d-flex flex-wrap align-items-center gap-3 mb-3">
+                <span class="req-id-badge">{{ v.vea_id }}</span>
+                {% if v.cve_id %}<code class="small">{{ v.cve_id }}</code>{% endif %}
+                <span class="tlp-badge tlp-{{ v.tlp | slug }}">TLP:{{ v.tlp | upper }}</span>
+                {% if v.audience %}<span class="text-muted small">{{ v.audience }}</span>{% endif %}
+                {% if v.cvss %}<span class="badge bg-secondary">{{ v.cvss }}</span>{% endif %}
+                {% if v.cisa_kev == 'Yes' %}<span class="badge bg-danger">CISA KEV</span>{% endif %}
+                <div class="d-flex flex-wrap align-items-center gap-2 ms-auto">
+                {% if v.review_state in ('draft', 'pending-review') %}
+                {{ approval_form(url_for('vea.approve', id=v.uuid), can_publish, (v.audience or '') | trim) }}
+                {{ review_checks('vea', v.uuid, url_for('vea.reject', id=v.uuid)) }}
+                {% endif %}
+                <button type="button" class="btn btn-xs btn-outline-secondary"
+                        data-recipients-url="{{ url_for('vea.recipients_fragment', id=v.uuid) }}"
+                        title="Preview recipients">
+                  <i class="fas fa-users me-1"></i>Recipients
+                </button>
+                </div>
+              </div>
+
+              {% if v.review_state in ('draft', 'pending-review') %}
+              <div class="qa-review-output mb-2" role="status" aria-live="polite"></div>
+              {% endif %}
+
+              <div class="row g-3">
+                <div class="col-lg-8">
+
+                  {% if v.summary %}
+                  <div class="mb-3">
+                    <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Summary</div>
+                    <div class="report-md-body" data-md="{{ v.summary | e }}" style="font-size:.88rem;"></div>
+                  </div>
+                  {% endif %}
+
+                  <div class="mb-3">
+                    <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Affected technology</div>
+                    <ul class="mb-0 ps-3">
+                      {% if v.affected_product %}<li style="font-size:.82rem;"><span class="pretext">Product:</span> {{ v.affected_product | md_inline }}</li>{% endif %}
+                      {% if v.affected_versions %}<li style="font-size:.82rem;"><span class="pretext">Versions:</span> {{ v.affected_versions | md_inline }}</li>{% endif %}
+                      {% if v.fixed_version %}<li style="font-size:.82rem;"><span class="pretext">Fixed in:</span> {{ v.fixed_version | md_inline }}</li>{% endif %}
+                      {% if v.exposure %}<li style="font-size:.82rem;"><span class="pretext">Exposure:</span> {{ v.exposure | md_inline }}</li>{% endif %}
+                    </ul>
+                  </div>
+
+                  <div class="mb-3">
+                    <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Exploitation status</div>
+                    <ul class="mb-0 ps-3">
+                      {% if v.observed_exploitation %}<li style="font-size:.82rem;"><span class="pretext">Observed:</span> {{ v.observed_exploitation | md_inline }}</li>{% endif %}
+                      {% if v.exploit_availability %}<li style="font-size:.82rem;"><span class="pretext">Availability:</span> {{ v.exploit_availability | md_inline }}</li>{% endif %}
+                      {% if v.exploitation_complexity %}<li style="font-size:.82rem;"><span class="pretext">Complexity:</span> {{ v.exploitation_complexity | md_inline }}</li>{% endif %}
+                    </ul>
+                  </div>
+
+                  {% if v.immediate_actions %}
+                  <div class="mb-3">
+                    <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Recommended actions</div>
+                    {{ bullets(v.immediate_actions) }}
+                    {% if v.patch_sla_internet or v.patch_sla_internal %}
+                    <p class="mt-2 mb-0" style="font-size:.78rem;">
+                      {% if v.patch_sla_internet %}<span class="pretext">Internet-facing SLA:</span> {{ v.patch_sla_internet | md_inline }}{% endif %}
+                      {% if v.patch_sla_internal %} &middot; <span class="pretext">Internal SLA:</span> {{ v.patch_sla_internal | md_inline }}{% endif %}
+                    </p>
+                    {% endif %}
+                  </div>
+                  {% endif %}
+
+                </div>
+
+                <div class="col-lg-4">
+                  <div class="border rounded p-2 mb-2" style="font-size:.8rem;background:var(--card-bg);">
+                    <div class="fw-semibold small mb-2">Risk &amp; severity</div>
+                    {% if v.cvss %}<p class="mb-1"><span class="pretext">CVSS:</span> {{ v.cvss }}</p>{% endif %}
+                    {% if v.cwe %}<p class="mb-1"><span class="pretext">CWE:</span> {{ v.cwe }}</p>{% endif %}
+                    {% if v.worst_case %}<div class="mb-1"><span class="pretext">Worst case:</span> {{ v.worst_case | md_inline }}</div>{% endif %}
+                    {% if v.most_likely %}<div class="mb-1"><span class="pretext">Most likely:</span> {{ v.most_likely | md_inline }}</div>{% endif %}
+                    {% if not v.cvss and not v.cwe and not v.worst_case and not v.most_likely %}
+                    <span class="text-muted">No risk data</span>
+                    {% endif %}
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      {% endif %}
+      {% endfor %}
+    </table>
+    </div>
+    {% elif filtered %}
+    <div class="p-4 text-muted">No vulnerability advisories match these filters.</div>
+    {% else %}
+    <div class="p-4 text-muted">No vulnerability advisories yet. <a href="{{ url_for('vea.wizard_new') }}">Create one</a>.</div>
+    {% endif %}
+  </div>
+</div>
+{% include "_published_delete_note.html" %}
+{% include "_recipients_modal.html" %}
+
+{# ── Inline feedback modal ── #}
+<div class="modal fade" id="feedback-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title">
+          <i class="fas fa-comment-dots me-2"></i>Feedback - <span id="feedback-product-id"></span>
+        </h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form id="feedback-form" method="post" action="">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="modal-body">
+          <div class="mb-3">
+            <label class="form-label small">Your name <span class="text-muted">(optional)</span></label>
+            <input type="text" name="author" class="form-control form-control-sm" placeholder="Name">
+          </div>
+          <div class="mb-3">
+            <label class="form-label small">Rating</label>
+            <select name="rating" class="form-select form-select-sm">
+              <option value="">- select rating -</option>
+              <option value="Very useful">Very useful</option>
+              <option value="Useful">Useful</option>
+              <option value="Somewhat useful">Somewhat useful</option>
+              <option value="Not useful">Not useful</option>
+            </select>
+          </div>
+          <div class="mb-2">
+            <label class="form-label small">Comments or suggestions</label>
+            <textarea name="comment" class="form-control form-control-sm" rows="4"
+                      placeholder="Patch status, exploitation observed, questions…"></textarea>
+          </div>
+        </div>
+        <div class="modal-footer py-2">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-sm btn-primary"><i class="fas fa-paper-plane me-1"></i>Submit</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% include "_markdown_js.html" %}
+{% include "_qa_review_js.html" %}
+{% include "_selection_js.html" %}
+<script>
+(function() {
+  document.querySelectorAll('.preview-toggle-btn').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var targetId = btn.getAttribute('data-target');
+      var row = document.getElementById(targetId);
+      if (!row) return;
+      var open = row.style.display !== 'none';
+      row.style.display = open ? 'none' : '';
+      btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+      var icon = btn.querySelector('i');
+      if (icon) {
+        icon.className = 'fas fa-fw ' + (open ? btn.dataset.previewIcon : 'fa-eye-slash');
+      }
+      if (!open) {
+        row.querySelectorAll('.report-md-body[data-md]').forEach(function(el) {
+          zsazsaRenderMarkdown(el, el.getAttribute('data-md'));
+          el.removeAttribute('data-md');
+        });
+      }
+    });
+  });
+
+  // Feedback modal wiring
+  var feedbackModal = document.getElementById('feedback-modal');
+  if (feedbackModal) {
+    feedbackModal.addEventListener('show.bs.modal', function(e) {
+      var trigger = e.relatedTarget;
+      if (!trigger) return;
+      document.getElementById('feedback-product-id').textContent = trigger.getAttribute('data-vea-id') || '';
+      document.getElementById('feedback-form').action = trigger.dataset.action;
+    });
+    feedbackModal.addEventListener('hidden.bs.modal', function() {
+      feedbackModal.querySelector('form').reset();
+    });
+  }
+})();
+</script>
+{% endblock %}

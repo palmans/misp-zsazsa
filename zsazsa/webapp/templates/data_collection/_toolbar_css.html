@@ -1,0 +1,555 @@
+{# Styles for the data collection toolbar: the dashboard-style action panel and
+   its chips, the source toggles, the collapsible filter panels, and the panels
+   the shared JS injects into the table (scope tagger, CTI evaluation). #}
+<style>
+  /* Shared panel look lives in app.css. This one is a single full-width panel
+     and holds the date and preset dropdowns and the cache popover, so it takes
+     neither a height nor overflow clipping, which would cut those off. */
+  .action-bar { margin-bottom: 1rem; }
+  .action-panel-head { gap: .75rem; padding: .55rem .9rem; }
+  .action-panel-title { white-space: nowrap; }
+  .action-panel-body { padding: .75rem .9rem; }
+
+  /* The card has the look of the stakeholder banner: its colour and corner
+     circle, white buttons on it, a white panel for the sources. It does not
+     clip what sticks out of it, so the circle is clipped in a layer of its own;
+     the parts are positioned to come over it, without a z-index, which would
+     make a part a layer that the next one covers the date menu with. */
+  .collection-panel { position: relative; z-index: 2; border: 0; border-radius: 12px; color: #fff;
+    background: var(--brand-gradient); box-shadow: var(--card-shadow); }
+  .collection-panel > :not(.panel-decor) { position: relative; }
+  .collection-panel .panel-decor { position: absolute; inset: 0; border-radius: inherit; overflow: hidden; pointer-events: none; }
+  .collection-panel .panel-decor::after { content: ""; position: absolute; right: -50px; top: -50px; width: 160px; height: 160px;
+    border-radius: 50%; background: var(--overlay-white-15); }
+  .collection-panel .action-panel-head { flex-wrap: wrap; padding: .5rem 1.1rem; border-bottom-color: rgba(255,255,255,.22); }
+  .collection-panel .action-panel-body { padding: .6rem 1.1rem .7rem; }
+  .collection-panel .action-panel-title { color: #fff; opacity: .9; letter-spacing: .12em; }
+  .collection-panel .hero-icon { width: 1.9rem; height: 1.9rem; border-radius: 8px; font-size: .85rem; }
+  .collection-panel .panel-count { display: inline-flex; align-items: baseline; gap: .3rem; white-space: nowrap;
+    font-variant-numeric: tabular-nums; }
+  .collection-panel .panel-count b { font-size: 1.2rem; }
+  .collection-panel .panel-count span { display: inline; margin-top: 0; font-size: .72rem; }
+  .collection-panel #clear-filters-btn { color: #fff; font-size: .76rem; white-space: nowrap; }
+  .collection-panel .panel-sep { font-size: .7rem; opacity: .6; user-select: none; }
+  .collection-panel #refresh-info,
+  .collection-panel .action-pill-refresh-meta { color: rgba(255,255,255,.85); }
+  .collection-panel .toolbar-row + .toolbar-row { border-top-color: rgba(255,255,255,.22); }
+  .collection-panel :focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  .collection-panel .dropdown-menu :focus-visible,
+  .collection-panel .collection-sources :focus-visible { outline-color: var(--accent-blue); }
+
+  /* Buttons as the banner's ghost buttons, one in use filled white. */
+  .collection-panel .action-pill,
+  .collection-panel .action-chip,
+  .collection-panel .toolbar-row > .btn-outline-secondary,
+  .collection-panel .toolbar-row > .dropdown > .btn-outline-secondary,
+  .collection-panel .hide-rej-btn.is-hiding {
+    background: rgba(255,255,255,.14);
+    border: 1px solid rgba(255,255,255,.45);
+    color: #fff;
+    font-size: .76rem;
+    font-weight: 600;
+  }
+  .collection-panel .action-pill:hover,
+  .collection-panel .action-chip:hover,
+  .collection-panel .toolbar-row > .btn-outline-secondary:hover,
+  .collection-panel .toolbar-row > .dropdown > .btn-outline-secondary:hover,
+  .collection-panel .hide-rej-btn.is-hiding:hover {
+    background: rgba(255,255,255,.24);
+    border-color: rgba(255,255,255,.65);
+    color: #fff;
+    box-shadow: none;
+  }
+  /* A filter button is white while its panel is open or one of its filters is
+     set, and only goes back to the card's colour when neither is so. The
+     filtered and open one is named too, as is each of them under the mouse:
+     the panel toggles' own rule further down would otherwise give it a dark
+     blue under navy text, and the hover above the card's colour again. */
+  .collection-panel .alt4-panel-toggle[aria-expanded="true"],
+  .collection-panel .alt4-panel-toggle.has-filter,
+  .collection-panel .alt4-panel-toggle.has-filter[aria-expanded="true"],
+  .collection-panel .toolbar-row > .alt4-panel-toggle[aria-expanded="true"]:hover,
+  .collection-panel .toolbar-row > .alt4-panel-toggle.has-filter:hover,
+  .collection-panel .toolbar-row > .dropdown > .btn.show,
+  .collection-panel .toolbar-row > .dropdown > .btn.show:hover,
+  .collection-panel .toolbar-row > .dropdown > .btn-primary,
+  .collection-panel .toolbar-row > .dropdown > .btn-primary:hover,
+  .collection-panel .hide-rej-btn.is-showing,
+  .collection-panel .action-pill-preview-active {
+    background: #fff;
+    border: 1px solid #fff;
+    color: var(--misp-navy);
+    font-size: .76rem;
+    font-weight: 600;
+  }
+  /* The green check on a button with a filter set, open or not. */
+  .collection-panel .filter-check { display: none; margin-left: .35rem; color: var(--accent-green); font-size: .62rem; }
+  .collection-panel .has-filter .filter-check { display: inline-block; }
+  .collection-panel .action-chip-icon { width: 20px; height: 20px; border-radius: 6px; font-size: .65rem; }
+  /* White and coloured text that the white button or the card's colour would swallow. */
+  .collection-panel .alt4-panel-toggle .badge { background: var(--misp-navy) !important; color: #fff; }
+  .collection-panel #bulk-reject-result { padding: .2rem .55rem; border-radius: .4rem; background: #fff; }
+  .collection-panel .action-pill-danger { background: #fff; border-color: #fff; color: var(--danger-red); }
+  .collection-panel .action-pill-danger:hover { background: var(--tag-exclude-bg); border-color: #fff; color: var(--tag-exclude-fg); }
+
+  /* The sources: a panel of chips, as the product subscriptions on the
+     stakeholder banner, through which the card's colour shows faintly. A
+     source that is on is tinted in its colour. */
+  .collection-panel .toolbar-row.collection-sources { margin-top: .6rem; padding: .45rem .6rem; border-top: 0; border-radius: 10px;
+    background: color-mix(in srgb, var(--card-bg) 80%, transparent); color: var(--text-primary); }
+  .collection-panel .chip-sources { gap: .3rem; }
+  .collection-panel .chip-sources .source-toggle { padding: .12rem .5rem .12rem .2rem; border-radius: 999px; background: transparent;
+    font-size: .72rem; opacity: .7; }
+  .collection-panel .chip-sources .source-toggle-on { opacity: 1; border-color: var(--tile-accent);
+    background: color-mix(in srgb, var(--tile-accent) 12%, var(--card-bg)); }
+  .collection-panel .chip-sources .source-toggle-icon { width: 20px; height: 20px; border-radius: 50%; font-size: .6rem; }
+  .collection-panel .chip-sources .source-toggle-err { border-color: var(--source-toggle-err-border); }
+  .collection-panel .chip-sources .source-toggle-err.source-toggle-on { background: var(--source-toggle-err-bg); }
+
+  button.action-chip { font: inherit; text-align: left; }
+
+  /* One action, on one line: coloured icon tile plus label. */
+  .action-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: .45rem;
+    padding: .3rem .6rem .3rem .35rem;
+    border-radius: var(--border-radius);
+    border: 1px solid var(--border-light);
+    background: var(--surface-muted);
+    text-decoration: none;
+    color: var(--text-primary);
+    font-size: .8rem;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: border-color .12s ease, background .12s ease, box-shadow .12s ease;
+  }
+  .action-chip:hover {
+    background: var(--card-bg);
+    border-color: var(--tile-accent);
+    box-shadow: 0 4px 12px -8px color-mix(in srgb, var(--tile-accent) 60%, transparent);
+    color: var(--text-primary);
+  }
+  .action-chip.disabled { opacity: .5; pointer-events: none; }
+  .action-chip-icon {
+    width: 24px; height: 24px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 7px;
+    font-size: .72rem;
+    color: #fff;
+    background: var(--tile-accent);
+    flex-shrink: 0;
+  }
+
+  /* ── Toolbar rows ─────────────────────────────────────────────── */
+  .toolbar-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: .35rem;
+  }
+  .toolbar-row + .toolbar-row {
+    margin-top: .5rem;
+    padding-top: .5rem;
+    border-top: 1px solid var(--border-faint);
+  }
+  .toolbar-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .35rem;
+    margin-left: auto;
+  }
+
+  /* Rounded search pill */
+  .alt4-search {
+    display: flex;
+    align-items: center;
+    gap: .3rem;
+    background: var(--card-bg);
+    border: 1.5px solid var(--form-border);
+    border-radius: 999px;
+    padding: .22rem .75rem;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .alt4-search:focus-within {
+    border-color: var(--accent-blue);
+    box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--accent-blue) 13%, transparent);
+  }
+  .alt4-search input {
+    border: 0;
+    outline: 0;
+    box-shadow: none !important;
+    font-size: .85rem;
+    background: transparent;
+    min-width: 160px;
+    max-width: 220px;
+  }
+  .alt4-search .search-icon { font-size: .76rem; color: var(--alt4-icon-muted); flex-shrink: 0; }
+
+  /* Panel toggle buttons */
+  .alt4-panel-toggle[aria-expanded="true"] {
+    background: var(--alt4-toggle-active-bg);
+    border-color: var(--alt4-toggle-active-border);
+    color: var(--chip-source-fg);
+  }
+  .alt4-panel-toggle.has-filter {
+    background: var(--accent-blue);
+    border-color: var(--alt4-blue-dark);
+    color: var(--text-on-accent);
+  }
+  .alt4-panel-toggle.has-filter[aria-expanded="true"] {
+    background: var(--alt4-blue-dark);
+    border-color: var(--alt4-blue-darker);
+  }
+
+  /* Collapsible filter panels */
+  .alt4-panel {
+    background: var(--alt4-panel-bg);
+    border: 1px solid var(--alt4-panel-border);
+    border-radius: .45rem;
+    padding: .7rem 1rem .65rem;
+    margin-bottom: .4rem;
+  }
+  .alt4-panel-head {
+    font-size: .64rem;
+    font-weight: 700;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    color: var(--neutral-600);
+    margin-bottom: .45rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  /* Source toggles use the same chip language as the actions on the right, so
+     the whole toolbar reads as one set of controls. A source that is switched
+     off keeps a grey icon tile, a source that is on carries its accent colour:
+     blue for the scraper, purple for a MISP instance, green for manual entry.
+     They are all of one size, whatever their label, and styled here, before
+     the table: styled after it, they changed size while the page loaded, and
+     on every reload after a refresh or a change to the events. A label too
+     long for its source is cut short; the tooltip has it in full. */
+  .chip-sources {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+    grid-auto-rows: 1fr;
+    gap: .5rem;
+    flex: 1;
+  }
+  .chip-sources .source-toggle {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    cursor: pointer;
+    user-select: none;
+    gap: .45rem;
+    padding: .3rem .6rem .3rem .35rem;
+    border: 1px solid var(--border-light);
+    border-radius: var(--border-radius);
+    background: var(--surface-muted);
+    color: var(--text-muted);
+    font-size: .8rem;
+    font-weight: 600;
+    transition: border-color .12s ease, background .12s ease, box-shadow .12s ease;
+  }
+  .chip-sources .source-toggle:hover {
+    background: var(--card-bg);
+    border-color: var(--tile-accent);
+    box-shadow: 0 4px 12px -8px color-mix(in srgb, var(--tile-accent) 60%, transparent);
+  }
+  .chip-sources .source-toggle-icon {
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 7px;
+    font-size: .72rem;
+    color: #fff;
+    background: var(--neutral-500);
+    flex-shrink: 0;
+    transition: background .12s ease;
+  }
+  .chip-sources .source-toggle-on {
+    background: var(--card-bg);
+    border-color: var(--tile-accent);
+    color: var(--text-primary);
+  }
+  .chip-sources .source-toggle-on .source-toggle-icon {
+    background: var(--tile-accent);
+    color: #fff;
+  }
+  .chip-sources .source-toggle-err { border-color: var(--source-toggle-err-border); }
+  .chip-sources .source-toggle-err .source-toggle-icon { background: var(--danger-red); }
+  .chip-sources .source-toggle-err.source-toggle-on { background: var(--source-toggle-err-bg); }
+  .chip-sources .source-chip-text {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    line-height: 1.15;
+    min-width: 0;
+  }
+  .chip-sources .source-toggle-label,
+  .chip-sources .source-chip-sub {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chip-sources .source-chip-sub {
+    font-size: .62rem;
+    font-weight: 400;
+    color: var(--text-muted);
+  }
+  .chip-sources .source-toggle-badge {
+    flex-shrink: 0;
+    min-width: 2.2rem;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    font-size: .62rem;
+    padding: .1rem .4rem;
+    border-radius: 999px;
+  }
+
+  /* An event's organisation filters the list on it. */
+  .org-filter-link { text-decoration: none; }
+  .org-filter-link:hover { text-decoration: underline; }
+
+  /* Hide-rejected toggle: action-pill sizing, only state colours differ */
+  .hide-rej-btn.is-hiding {
+    background: var(--alt4-hide-rej-bg);
+    border-color: var(--alt4-hide-rej-border);
+    color: var(--alt4-hide-rej-fg);
+  }
+  .hide-rej-btn.is-hiding:hover { background: var(--alt4-hide-rej-hover-bg); border-color: var(--alt4-hide-rej-hover-border); }
+  .hide-rej-btn.is-showing { border-style: dashed; }
+
+  /* Active preset indicator */
+  .preset-active-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: .35rem;
+    padding: .28rem .55rem;
+    border: 1px solid var(--alt4-preset-border);
+    border-radius: .4rem;
+    background: var(--neutral-100);
+    color: var(--alt4-preset-fg);
+    font-size: .72rem;
+    line-height: 1;
+    max-width: 320px;
+  }
+  .preset-active-indicator .preset-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 220px;
+  }
+  .preset-active-indicator.modified {
+    background: var(--vuln-advisory-bg);
+    border-color: var(--vuln-advisory-border);
+    color: var(--vuln-advisory-fg);
+  }
+  .preset-clear-btn {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    opacity: .62;
+    padding: 0;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .preset-clear-btn:hover { opacity: .95; }
+
+  /* Scope tagger buttons in the table */
+  .scope-btn-group { display: inline-flex; gap: .2rem; flex-wrap: wrap; }
+  .scope-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.4rem;
+    height: 1.4rem;
+    border: 1px solid var(--neutral-300);
+    border-radius: .3rem;
+    background: var(--card-bg);
+    color: var(--alt4-icon-muted);
+    cursor: pointer;
+    font-size: .6rem;
+    transition: border-color .12s, background .12s, color .12s;
+    padding: 0;
+  }
+  .scope-btn:hover { border-color: var(--accent-blue); background: var(--source-toggle-hover-bg); color: var(--accent-blue); }
+  .scope-btn.active { border-color: var(--accent-blue); background: var(--source-toggle-on-bg); color: var(--pill-active-fg); }
+
+  /* Scope panel (inserted as a table row below the event) */
+  .scope-panel-row > td { padding: 0 !important; border-top: 0 !important; }
+  .scope-panel-container {
+    background: var(--alt4-panel-bg);
+    border-top: 2px solid var(--accent-blue);
+    padding: .65rem .75rem;
+  }
+  .scope-panel-header { display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+  .scope-panel-type-label {
+    font-size: .7rem;
+    font-weight: 700;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+    color: var(--accent-blue);
+  }
+  .scope-panel-search {
+    flex: 1;
+    max-width: 220px;
+    font-size: .78rem;
+    padding: .2rem .5rem;
+    border: 1px solid var(--neutral-300);
+    border-radius: .3rem;
+  }
+  .scope-selected-chips { display: flex; flex-wrap: wrap; gap: .25rem; min-height: 0; margin-bottom: .4rem; }
+  .scope-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: .25rem;
+    padding: .15rem .45rem;
+    border-radius: 999px;
+    background: var(--source-toggle-on-bg);
+    color: var(--pill-active-fg);
+    border: 1px solid var(--alt4-scope-chip-border);
+    font-size: .68rem;
+    font-weight: 500;
+  }
+  .scope-chip-remove { cursor: pointer; opacity: .6; padding: 0 .1rem; }
+  .scope-chip-remove:hover { opacity: 1; }
+  .scope-item-list { display: flex; flex-wrap: wrap; gap: .2rem .4rem; max-height: 160px; overflow-y: auto; }
+  .scope-item {
+    display: flex;
+    align-items: center;
+    gap: .25rem;
+    padding: .12rem .35rem;
+    font-size: .72rem;
+    cursor: pointer;
+    border-radius: .25rem;
+    color: var(--neutral-700);
+    white-space: nowrap;
+    user-select: none;
+  }
+  .scope-item:hover { background: var(--neutral-200); }
+  .scope-item input { cursor: pointer; margin: 0; }
+  .scope-item.hidden { display: none; }
+  .scope-custom-add { display: flex; align-items: center; gap: .35rem; margin-bottom: .45rem; }
+  .scope-custom-add input { flex: 1; min-width: 220px; font-size: .78rem; }
+
+  /* CTI Evaluation inline panel */
+  .cti-eval-panel-row > td { padding: 0 !important; border-top: 0 !important; }
+  .cti-eval-panel-container {
+    background: var(--alt4-panel-bg);
+    border-top: 2px solid var(--accent-blue);
+    padding: .65rem .75rem .75rem;
+  }
+  .cti-eval-panel-header { display: flex; align-items: center; gap: .45rem; margin-bottom: .35rem; }
+  .cti-eval-panel-title {
+    font-size: .7rem;
+    font-weight: 700;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+    color: var(--accent-blue);
+  }
+  .cti-eval-panel-event-name { font-size: .75rem; color: var(--text-muted); flex: 1; min-width: 0; }
+  .cti-eval-panel-close {
+    background: none;
+    border: none;
+    font-size: 1rem;
+    line-height: 1;
+    color: var(--alt4-icon-muted);
+    cursor: pointer;
+    padding: 0 .15rem;
+    flex-shrink: 0;
+  }
+  .cti-eval-panel-close:hover { color: var(--text-primary); }
+  .cti-eval-predicates { display: flex; flex-wrap: wrap; gap: .15rem .75rem; }
+  .cti-pred-item {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    flex: 1 1 calc(50% - .375rem);
+    min-width: 220px;
+    padding: .18rem 0;
+  }
+  .cti-pred-label { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .cti-pred-desc { font-size: .68rem; }
+  .cti-pred-item .form-select { width: 8rem; flex-shrink: 0; }
+
+  /* Active chips bar */
+  .alt4-chips { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; min-height: 0; margin-bottom: .5rem; }
+
+  /* Action pills */
+  .action-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: .3rem;
+    padding: .26rem .6rem;
+    border: 1.5px solid var(--neutral-300);
+    border-radius: .4rem;
+    background: var(--card-bg);
+    font-size: .78rem;
+    color: var(--neutral-600);
+    cursor: pointer;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: border-color .12s, background .12s, color .12s;
+    line-height: 1.4;
+    vertical-align: middle;
+  }
+  .action-pill:hover {
+    border-color: var(--neutral-500);
+    background: var(--neutral-50);
+    color: var(--neutral-700);
+    text-decoration: none;
+  }
+  .action-pill:disabled, .action-pill.disabled { opacity: .55; cursor: not-allowed; pointer-events: none; }
+  .action-pill-danger {
+    border-color: var(--alt4-danger-border);
+    color: var(--alt4-danger-fg);
+    background: var(--alt4-danger-bg);
+  }
+  .action-pill-danger:hover {
+    border-color: var(--danger-red);
+    background: var(--tag-exclude-bg);
+    color: var(--tag-exclude-fg);
+  }
+  .action-pill-refresh-meta {
+    font-size: .7rem;
+    color: var(--alt4-icon-muted);
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, monospace;
+  }
+  .action-pill-preview-active {
+    border-color: var(--accent-blue);
+    background: var(--chip-source-bg);
+    color: var(--chip-source-fg);
+  }
+  .action-pill-preview-active:hover {
+    border-color: var(--alt4-blue-dark);
+    background: var(--alt4-preview-active-hover-bg);
+    color: var(--alt4-preview-active-hover-fg);
+  }
+  .exclusion-actions { display: inline-flex; align-items: center; gap: .35rem; flex-wrap: nowrap; }
+
+  /* Top words in the event titles, in the table header: no taller than a source chip. */
+  /* The chart keeps its height while it is empty: drawn after the page, or
+     emptied by a filter, it made the header grow or shrink and moved the
+     table. Not with the hidden attribute, which Bootstrap takes out of the
+     layout whatever this says. */
+  .title-words { display: flex; align-items: center; gap: .6rem; min-width: 0; overflow: hidden; height: 32px; }
+  .title-words.is-empty { visibility: hidden; }
+  .title-words-caption { font-size: .7rem; font-weight: 400; color: var(--text-muted); white-space: nowrap; }
+  .title-words-bars { display: flex; align-items: flex-end; gap: .2rem; }
+  .title-word {
+    display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 3px;
+    height: 32px; padding: 0 .35rem 2px; border: 1px solid transparent; border-radius: 6px;
+    background: none; color: var(--text-muted); font-size: .7rem; font-weight: 500; line-height: 1;
+    white-space: nowrap; cursor: pointer;
+  }
+  .title-word:hover { background: var(--surface-muted); border-color: var(--border-light); color: var(--text-primary); }
+  .title-word.selected { border-color: var(--accent-blue); color: var(--text-primary); }
+  .title-word-bar { width: 1.25rem; background: var(--accent-blue); border-radius: 4px 4px 0 0; }
+</style>

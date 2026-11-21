@@ -1,0 +1,687 @@
+"""Read the logged-in user out of MISP's shared PHP session.
+
+MISP (CakePHP) stores sessions in Redis under the key
+``PHPREDIS_SESSION:<session id>``, where ``<session id>`` is the value of
+the ``MISP-<uuid>`` cookie. The value is PHP's "php" session serialize
+format: a sequence of ``key|value`` pairs where each value is itself
+PHP-serialized. After login, CakePHP's AuthComponent stores the full user
+record under the ``Auth`` key as ``Auth.User``.
+
+This module talks to that Redis instance directly over a plain socket
+(no redis-py dependency) and parses just enough of the PHP serialize
+format to pull out ``Auth.User``.
+
+zsazsa only reads the session. Keeping it alive is left to MISP: while
+someone uses zsazsa, MISP is asked every few minutes for that user's own
+record with their session cookie, and refreshes the session as it does for
+any page of its own. Only page loads and actions count as use, not the
+requests a page makes in the background.
+"""
+
+import logging
+import re
+import socket
+import time
+from contextlib import contextmanager
+
+import requests
+from flask import g, jsonify, request
+
+import config
+from webapp import sso_users
+from webapp.redis_client import RedisError, read_reply as _read_reply, send_command as _send_command
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_USER_EMAIL = "admin@admin.test"
+
+# The prefix PHP's redis session handler uses, unless session.save_path
+# overrides it with a ?prefix= parameter.
+_SESSION_KEY_PREFIX = "PHPREDIS_SESSION:"
+
+
+def _configured_db():
+    """The database index zsazsa is told MISP's sessions are in."""
+    return getattr(config, "MISP_SESSION_REDIS_DB", 0) or 0
+
+
+@contextmanager
+def _redis_connect():
+    """An authenticated socket on MISP's session Redis, on the configured database."""
+    host = getattr(config, "MISP_SESSION_REDIS_HOST", "127.0.0.1")
+    port = getattr(config, "MISP_SESSION_REDIS_PORT", 6379)
+    db = _configured_db()
+    username = getattr(config, "MISP_SESSION_REDIS_USERNAME", "")
+    password = getattr(config, "MISP_SESSION_REDIS_PASSWORD", "")
+
+    sock = socket.create_connection((host, port), timeout=2)
+    try:
+        if password:
+            if username:
+                _send_command(sock, "AUTH", username, password)
+            else:
+                _send_command(sock, "AUTH", password)
+            _read_reply(sock)
+        if db:
+            _send_command(sock, "SELECT", db)
+            _read_reply(sock)
+        yield sock
+    finally:
+        sock.close()
+
+
+def _redis_get(key):
+    """Fetch a single key from MISP's session Redis. Returns bytes or None."""
+    with _redis_connect() as sock:
+        _send_command(sock, "GET", key)
+        return _read_reply(sock)
+
+
+def _scan_for_sessions(sock):
+    """Whether the database this socket is on holds any PHP session key.
+
+    Only key names are read, never values: the value under a session key is the
+    session. The scan stops at the first hit and gives up after a few batches, so
+    a busy Redis cannot stall the page that asks.
+    """
+    cursor = "0"
+    for _ in range(10):
+        _send_command(sock, "SCAN", cursor, "MATCH", f"{_SESSION_KEY_PREFIX}*", "COUNT", "200")
+        cursor, keys = _read_reply(sock)
+        if keys:
+            return True
+        cursor = cursor.decode()
+        if cursor == "0":
+            break
+    return False
+
+
+def _populated_databases(sock):
+    """Database indexes on this Redis that hold keys, the configured one aside.
+
+    INFO keyspace lists only the non-empty ones, so this is one command rather
+    than a sweep of all sixteen. An instance whose ACL refuses INFO answers
+    with an error, and the caller manages without.
+    """
+    try:
+        _send_command(sock, "INFO", "keyspace")
+        reply = _read_reply(sock) or b""
+    except RedisError:
+        return []
+    indexes = (int(n) for n in re.findall(rb"^db(\d+):", reply, re.MULTILINE))
+    return [db for db in indexes if db != _configured_db()]
+
+
+def _database_with_sessions():
+    """Which database on MISP's session Redis holds PHP sessions.
+
+    None when none of them does, and equally when the Redis could not be
+    asked: both callers are already explaining a failure and have nothing more
+    to say in either case.
+
+    The configured database is tried first and is normally the answer. The
+    rest are for the install that took MISP's own redis_database, 13 by
+    default, to be the session database: PHP puts sessions where
+    session.save_path names, which is database 0 in everything MISP's
+    installers set up, so zsazsa reads an empty one and cannot say why.
+    """
+    try:
+        with _redis_connect() as sock:
+            if _scan_for_sessions(sock):
+                return _configured_db()
+            for db in _populated_databases(sock):
+                _send_command(sock, "SELECT", db)
+                _read_reply(sock)
+                if _scan_for_sessions(sock):
+                    return db
+    except (OSError, RedisError) as e:
+        logger.debug("could not work out which database holds MISP's sessions: %s", e)
+    return None
+
+
+def _parse_php_value(data, pos):
+    """Parse one PHP serialize() value from `data` starting at `pos`.
+
+    Returns (value, next_pos). Covers the types CakePHP uses in session
+    data: N (null), b (bool), i (int), d (float), s (string), a (array).
+    """
+    kind = data[pos:pos + 1]
+    if kind == b"N":
+        return None, pos + 2
+    if kind == b"b":
+        end = data.index(b";", pos)
+        return data[pos + 2:end] == b"1", end + 1
+    if kind == b"i":
+        end = data.index(b";", pos)
+        return int(data[pos + 2:end]), end + 1
+    if kind == b"d":
+        end = data.index(b";", pos)
+        return float(data[pos + 2:end]), end + 1
+    if kind == b"s":
+        colon = data.index(b":", pos + 2)
+        length = int(data[pos + 2:colon])
+        start = colon + 2  # skip ':"'
+        end = start + length
+        return data[start:end].decode("utf-8", "replace"), end + 2  # skip '";'
+    if kind == b"a":
+        colon = data.index(b":", pos + 2)
+        count = int(data[pos + 2:colon])
+        pos = colon + 2  # skip ':{'
+        result = {}
+        for _ in range(count):
+            item_key, pos = _parse_php_value(data, pos)
+            item_value, pos = _parse_php_value(data, pos)
+            result[item_key] = item_value
+        return result, pos + 1  # skip '}'
+    raise ValueError(f"unsupported PHP serialize type {kind!r} at offset {pos}")
+
+
+def _parse_php_session(data):
+    """Parse PHP's 'php' session serialize format into a dict of top-level keys."""
+    result = {}
+    pos = 0
+    while pos < len(data):
+        sep = data.index(b"|", pos)
+        key = data[pos:sep].decode("ascii")
+        value, pos = _parse_php_value(data, sep + 1)
+        result[key] = value
+    return result
+
+
+def _read_session(session_id):
+    """The parsed PHP session behind a session ID, or None."""
+    try:
+        raw = _redis_get(f"{_SESSION_KEY_PREFIX}{session_id}")
+    except (OSError, RedisError) as e:
+        logger.warning("could not read MISP session from Redis: %s", e)
+        return None
+
+    if raw is None:
+        return None
+
+    try:
+        return _parse_php_session(raw)
+    except (ValueError, IndexError) as e:
+        logger.warning("could not parse MISP session data: %s", e)
+        return None
+
+
+def _session_config(session):
+    """The Config entry CakePHP keeps in a session: time, countdown, userAgent."""
+    config_entry = session.get("Config")
+    return config_entry if isinstance(config_entry, dict) else {}
+
+
+def _seconds_left(session):
+    """Seconds until MISP's own timeout runs out on this session, or None.
+
+    CakePHP keeps the moment a session expires in Config.time and sets it to
+    Session.timeout from now on every request MISP serves. Past it, MISP
+    destroys the session on its next request.
+    """
+    expires = _session_config(session).get("time")
+    return expires - time.time() if isinstance(expires, (int, float)) else None
+
+
+def _renews_session_id(session):
+    """Whether the next request MISP serves for this session gives it a new ID.
+
+    With Session.autoRegenerate on, CakePHP counts requests down in
+    Config.countdown and renews the ID when it runs out, deleting the old
+    session. Sent by zsazsa, that request would get the new ID instead of the
+    browser, which would be signed out of zsazsa and MISP both.
+    """
+    countdown = _session_config(session).get("countdown")
+    return isinstance(countdown, int) and countdown <= 1
+
+
+def _expired(session):
+    """Whether MISP's own timeout has run out on this session.
+
+    The Redis key can live on well after that (MISP gives it
+    Session.cookieTimeout when that is set), so the key existing does not mean
+    MISP still accepts the session.
+    """
+    left = _seconds_left(session)
+    return left is not None and left < 0
+
+
+def get_misp_user(session_id):
+    """Return the MISP Auth.User dict for a session ID, or None.
+
+    This reflects whatever CakePHP wrote to the session at login time, not
+    necessarily the live database state (e.g. a user disabled after login
+    keeps a session until MISP itself re-checks and rewrites it). A session
+    MISP's timeout has run out on counts as no session.
+    """
+    if not session_id:
+        return None
+
+    session = _read_session(session_id)
+    if session is None or _expired(session):
+        return None
+
+    user = session.get("Auth", {}).get("User")
+    if not user or user.get("disabled"):
+        return None
+
+    return user
+
+
+# The cookie name is asked of MISP once and then kept for the life of the
+# process, since an instance UUID does not change. A failed lookup is not
+# retried for a while: this runs before every request, so an unreachable MISP
+# would otherwise cost each one a connection attempt.
+_RETRY_AFTER_SECONDS = 60
+_DERIVE_TIMEOUT_S = 5
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+_cookie_name_cache = {"value": "", "retry_after": 0.0}
+
+# Causes already reported, so a misconfiguration is logged once rather than on
+# every request it breaks.
+_warned_misses = set()
+
+
+def derive_cookie_name():
+    """Return MISP's session cookie name derived from the server's instance UUID.
+
+    MISP names its session cookie ``MISP-<instance uuid>``, unique per install,
+    so the name has to come from the MISP zsazsa is served behind: the one it
+    stores its data in, not the misp-scraper instance it only polls. Those are
+    often the same server, which is why reading the scraper went unnoticed.
+    Returns ``MISP-<uuid>`` on success, or "" if the MISP server could not be
+    reached or did not report a UUID. MISP reports it only to a key whose role
+    has sync permission, and "-" to any other, which made a name that matches
+    no cookie and sent every request to the MISP login.
+    """
+    try:
+        from pymisp import PyMISP
+        misp = PyMISP(config.MISP_WEBAPP_URL, config.MISP_WEBAPP_KEY,
+                      config.MISP_WEBAPP_VERIFYCERT, timeout=_DERIVE_TIMEOUT_S)
+        uuid = (misp.misp_instance_version or {}).get("uuid") or ""
+        if _UUID_RE.fullmatch(uuid):
+            return f"MISP-{uuid}"
+        logger.warning("MISP did not report its instance UUID to MISP_WEBAPP_KEY, so the session cookie "
+                       "name stays as it is. MISP reports it only to a role with sync permission.")
+    except Exception as e:
+        logger.warning("could not derive MISP session cookie name from %s: %s",
+                       getattr(config, "MISP_WEBAPP_URL", ""), e)
+    return ""
+
+
+def _session_cookie_name():
+    """Return the name of MISP's session cookie.
+
+    When MISP_SESSION_COOKIE_NAME is set in config it is used as-is (it is stored
+    there automatically when single sign-on is enabled). Otherwise the name is
+    derived once from the MISP server's instance UUID and cached, so SSO still
+    works before the value has been persisted. While MISP is unreachable the
+    name stays empty, which leaves the request unidentified rather than failing.
+    """
+    configured = (getattr(config, "MISP_SESSION_COOKIE_NAME", "") or "").strip()
+    if configured:
+        return configured
+    if not _cookie_name_cache["value"] and time.monotonic() >= _cookie_name_cache["retry_after"]:
+        _cookie_name_cache["value"] = derive_cookie_name()
+        if not _cookie_name_cache["value"]:
+            _cookie_name_cache["retry_after"] = time.monotonic() + _RETRY_AFTER_SECONDS
+    return _cookie_name_cache["value"]
+
+
+def _miss_cause(cookie_name, session_id):
+    """Which of the three ways single sign-on missed this request."""
+    if not cookie_name:
+        return "no-cookie-name"
+    if not session_id:
+        return "no-cookie"
+    return "no-session"
+
+
+def _explain_miss(cause, cookie_name):
+    """Why the request could not be identified, as a sentence for the operator.
+
+    The setups that break single sign-on look identical from here: no user.
+    Saying which one it was is the difference between a five-minute fix and
+    reading the source, and the log is the only place that can say it once the
+    redirect is on, since that keeps the operator out of the settings page.
+
+    Called only when the line is about to be written, because working out where
+    the sessions really are costs a scan of the Redis.
+    """
+    if cause == "no-cookie-name":
+        return ("could not determine MISP's session cookie name; MISP may be unreachable, or "
+                "set MISP_SESSION_COOKIE_NAME by hand")
+    if cause == "no-cookie":
+        seen = ", ".join(sorted(request.cookies)[:10]) or "none"
+        return (f"the browser sent no {cookie_name} cookie (cookies seen: {seen}); if MISP names "
+                f"its cookie differently, set MISP_SESSION_COOKIE_NAME to that name")
+
+    holding = _database_with_sessions()
+    if holding == _configured_db():
+        return (f"no session behind the {cookie_name} cookie, though MISP's session Redis does "
+                f"hold PHP sessions; the cookie is most likely one that has expired")
+    if holding is not None:
+        return (f"no session behind the {cookie_name} cookie in database {_configured_db()} of "
+                f"MISP's session Redis, but database {holding} of it does hold PHP sessions; set "
+                f"MISP_SESSION_REDIS_DB to {holding}")
+    return (f"no session behind the {cookie_name} cookie in MISP's session Redis; check that PHP "
+            f"stores MISP's sessions there (session.save_handler = redis) and that "
+            f"MISP_SESSION_REDIS_* names the same instance and database")
+
+
+# How often use of zsazsa has MISP refresh a session, at most: one request to
+# MISP per user every few minutes. A session with less time than this left is
+# refreshed anyway, since MISP's Session.timeout can be shorter.
+_KEEPALIVE_EVERY_S = 300
+_VIEW_ME_TIMEOUT_S = 5
+
+# Session ID -> time.monotonic() of the last refresh asked for it.
+_last_keepalive = {}
+
+
+def _view_own_record(cookie_name, session_id):
+    """MISP's /users/view/me, asked with the user's own session cookie.
+
+    The browser's user agent goes along, since with Session.checkAgent on MISP
+    destroys a session that is used from another one.
+    """
+    return requests.get(f"{config.MISP_WEBAPP_URL.rstrip('/')}/users/view/me.json",
+                        cookies={cookie_name: session_id},
+                        headers={"Accept": "application/json",
+                                 "User-Agent": request.headers.get("User-Agent", "")},
+                        timeout=_VIEW_ME_TIMEOUT_S, verify=config.MISP_WEBAPP_VERIFYCERT,
+                        allow_redirects=False)
+
+
+def keep_misp_session_alive(cookie_name, session_id):
+    """Have MISP refresh this session, as a page of MISP's own would.
+
+    Each request MISP serves moves the session's expiry forward, both the
+    Config.time CakePHP keeps in it and the lifetime of its Redis key. Asking
+    MISP for the user's own record with their session cookie takes it through
+    that same path. /users/view/me does, where the version check and the
+    searches close the session without saving it.
+
+    Never on the request that would give the session a new ID: that renewal
+    is left to the next page the user opens in MISP.
+    """
+    session = _read_session(session_id) or {}
+    if _renews_session_id(session):
+        return
+    now = time.monotonic()
+    last = _last_keepalive.get(session_id)
+    left = _seconds_left(session)
+    runs_out_soon = left is not None and left < _KEEPALIVE_EVERY_S
+    if last is not None and now - last < _KEEPALIVE_EVERY_S and not runs_out_soon:
+        return
+    # Forget the sessions not seen for a while, so this stays the size of the
+    # sessions in use.
+    for sid, at in list(_last_keepalive.items()):
+        if now - at >= _KEEPALIVE_EVERY_S:
+            # Not del: another request can be doing the same.
+            _last_keepalive.pop(sid, None)
+    _last_keepalive[session_id] = now
+
+    try:
+        r = _view_own_record(cookie_name, session_id)
+    except requests.RequestException as e:
+        logger.warning("could not have MISP refresh a session: %s", e)
+        return
+    if r.status_code != 200:
+        logger.warning("MISP did not refresh a session: HTTP %s from %s", r.status_code, r.url)
+
+
+def load_request_user():
+    """Look up the MISP user for the current request and cache it on flask.g."""
+    cookie_name = _session_cookie_name()
+    session_id = request.cookies.get(cookie_name) if cookie_name else None
+    g.misp_user = get_misp_user(session_id)
+    # The top bar polls for jobs every few seconds while a tab is visible. That
+    # is not someone at work, and counting it would keep the session of an
+    # unattended screen alive for good, so a background fetch (Sec-Fetch-Mode
+    # cors) is left out. Page loads and actions, which post, count.
+    background = request.method == "GET" and request.headers.get("Sec-Fetch-Mode", "navigate") != "navigate"
+    if g.misp_user is not None and not background:
+        keep_misp_session_alive(cookie_name, session_id)
+
+    # Only worth reporting when single sign-on is meant to be working, and only
+    # once per cause: this runs in front of every request, and the cause does not
+    # change between them. Keyed on the cause rather than the message, which names
+    # the cookies the caller sent and would otherwise let anyone grow this set and
+    # the log by varying them.
+    if g.misp_user is None and getattr(config, "MISP_SESSION_REDIRECT_TO_LOGIN", False):
+        cause = _miss_cause(cookie_name, session_id)
+        if cause not in _warned_misses:
+            _warned_misses.add(cause)
+            logger.warning("single sign-on could not identify the request: %s",
+                           _explain_miss(cause, cookie_name))
+
+
+def current_user_email():
+    """Email of the MISP user identified for this request, or a fallback.
+
+    Also used by standalone scripts that call into webapp.misp_store outside
+    of a Flask request, where there is no flask.g to read from at all.
+    """
+    try:
+        user = getattr(g, "misp_user", None)
+    except RuntimeError:
+        return DEFAULT_USER_EMAIL
+    return user["email"] if user else DEFAULT_USER_EMAIL
+
+
+def sso_configured():
+    """Whether single sign-on is set up, so that requests are meant to come from a MISP user.
+
+    Either setting says so. The redirect is the switch on the settings page, and
+    saving with it on stores MISP_SESSION_COOKIE_NAME, which stays behind when the
+    redirect is turned off again. That is the mode where anyone without a session
+    falls back to admin@admin.test, and where the publish gate needs to know that
+    the fallback is not a real, trusted user.
+
+    So does any user ever recognised through a session, settings or not. zsazsa
+    derives the cookie name by itself when it is not set, and leaving the cookie
+    out would otherwise be enough to pass for the trusted identity of an install
+    without single sign-on.
+    """
+    return bool(getattr(config, "MISP_SESSION_REDIRECT_TO_LOGIN", False)
+                or (getattr(config, "MISP_SESSION_COOKIE_NAME", "") or "").strip()
+                or sso_users.any_recorded())
+
+
+def current_user_can_publish():
+    """Whether the current user may approve/publish a CTI product (the "senior
+    reviewer" gate on top of the draft -> pending-review -> approved workflow).
+
+    Reuses MISP's own ``perm_publish`` role permission rather than inventing a
+    zsazsa-specific role: zsazsa has no user/role management of its own, and
+    this is the closest existing analog to "trusted to make something public".
+
+    A request nobody could be identified for is refused as soon as single
+    sign-on is configured. Dropping the MISP cookie is enough to end up there,
+    and so is a session Redis that is down or misconfigured, and neither should
+    turn an analyst into a publisher. Only an install without single sign-on,
+    where the whole app runs under one trusted identity, and a standalone script
+    outside a Flask request are let through without a user.
+    """
+    return _current_user_has("perm_publish")
+
+
+def current_user_is_admin():
+    """Whether the session says the current user is a MISP site admin.
+
+    Good enough for showing the Settings menu, which is on every page. The
+    settings pages themselves ask MISP; see refuse_unless_site_admin.
+    """
+    return _current_user_has("perm_site_admin")
+
+
+def _current_user_has(perm):
+    """Whether the current user's MISP role, as the session has it, grants ``perm``."""
+    try:
+        user = getattr(g, "misp_user", None)
+    except RuntimeError:
+        return True
+    if user is None:
+        return not sso_configured()
+    return _role_grants(user.get("Role"), perm)
+
+
+def _role_grants(role, perm):
+    """The permission has to be MISP's true (a PHP bool, or 1 / "1" depending on
+    how the role was written), not merely truthy: "0" is a non-empty string."""
+    value = (role or {}).get(perm)
+    return value is True or (type(value) is int and value == 1) or value == "1"
+
+
+def publish_denied_message(action="publish"):
+    """The warning shown when the publish gate refuses, e.g. action="approve and publish".
+
+    One sentence for every product, so the gate reads the same wherever it bites.
+    """
+    return f"Only users with MISP publish rights can {action}."
+
+
+def refuse_unless_site_admin():
+    """A 403 for the settings pages unless the user is a MISP site admin now.
+
+    The session keeps the role a user had when they logged in to MISP, so the
+    role is asked of MISP on every request instead: a user made site admin gets
+    in straight away, and one who lost it is out straight away. Nobody gets in
+    when MISP cannot be asked. Returns None when the request may go ahead.
+
+    MISP is asked with the user's own session, for their own record. Looking
+    them up with MISP_WEBAPP_KEY would need that key to be a site admin's:
+    MISP shows another user's record to a site admin only, not to an org admin.
+    """
+    message = "Only MISP site admins can open the zsazsa settings."
+    user = getattr(g, "misp_user", None)
+    if user is None:
+        if not sso_configured():
+            return None
+    else:
+        cookie_name = _session_cookie_name()
+        session_id = request.cookies.get(cookie_name)
+        if _renews_session_id(_read_session(session_id) or {}):
+            message = ("MISP is about to give your session a new ID. Open any page in MISP first, then reload "
+                       "this one. If that does not help, log out of MISP and in again.")
+        else:
+            try:
+                r = _view_own_record(cookie_name, session_id)
+                if r.status_code != 200:
+                    raise RuntimeError(f"HTTP {r.status_code} from {r.url}")
+                if _role_grants(r.json().get("Role"), "perm_site_admin"):
+                    return None
+            except Exception as exc:
+                logger.warning("could not ask MISP for the role of %s, so the settings stay closed: %s",
+                               user.get("email"), exc)
+                message = "Could not check your role in MISP, so the settings stay closed. See the zsazsa log."
+    if request.is_json:
+        return jsonify({"ok": False, "error": message}), 403
+    return message, 403
+
+
+def diagnose(cookies) -> dict:
+    """Check single sign-on against the cookies of a real request.
+
+    `cookies` is the request's cookie mapping. Only cookie *names* are reported:
+    the value of MISP's session cookie is a session id, and printing it on a
+    settings page would hand over a live session.
+
+    Returns {"checks": [{"label", "ok", "detail"}], "hint"}.
+    """
+    checks = []
+    configured = (getattr(config, "MISP_SESSION_COOKIE_NAME", "") or "").strip()
+    cookie_name = _session_cookie_name()
+    checks.append({
+        "label": "Session cookie name",
+        "ok": bool(cookie_name),
+        "detail": (f"{cookie_name} ({'set in the configuration' if configured else 'detected from MISP'})"
+                   if cookie_name else "not known; MISP could not be reached and none is configured"),
+    })
+
+    session_id = cookies.get(cookie_name) if cookie_name else None
+    checks.append({
+        "label": "Cookie sent by your browser",
+        "ok": bool(session_id),
+        "detail": (f"{cookie_name} was sent" if session_id
+                   else "cookies received: " + (", ".join(sorted(cookies)) or "none")),
+    })
+
+    try:
+        with _redis_connect():
+            pass
+        checks.append({"label": "Session Redis", "ok": True,
+                       "detail": f"reachable, database {_configured_db()}"})
+        redis_ok = True
+    except (OSError, RedisError) as e:
+        checks.append({"label": "Session Redis", "ok": False, "detail": str(e)})
+        redis_ok = False
+
+    user = get_misp_user(session_id) if session_id and redis_ok else None
+    holding = None
+    expired = False
+    if session_id and redis_ok:
+        session = None if user else _read_session(session_id)
+        expired = session is not None and _expired(session)
+        if user:
+            detail = f"identified {user.get('email', '?')}"
+        elif expired:
+            detail = "expired: MISP's session timeout passed since the last request MISP served"
+        else:
+            # Where the sessions are separates the three setups that all look
+            # like "no user" from here and want different fixes: PHP writing
+            # them elsewhere, PHP writing them to another database of this same
+            # Redis, and this one cookie having no session left behind it.
+            holding = _database_with_sessions()
+            if holding == _configured_db():
+                detail = "not found, though this Redis does hold PHP sessions"
+            elif holding is not None:
+                detail = (f"not found in database {_configured_db()}, but database {holding} "
+                          f"of this Redis does hold PHP sessions")
+            else:
+                detail = "not found, and this Redis holds no PHP sessions at all"
+        checks.append({"label": "MISP session", "ok": user is not None, "detail": detail})
+
+    hint = ""
+    if not user:
+        failed = next((c for c in checks if not c["ok"]), None)
+        label = failed["label"] if failed else ""
+        if label == "Cookie sent by your browser":
+            hint = ("MISP does not always name its cookie MISP-<uuid>. If one of the cookies "
+                    "above is MISP's session cookie, set MISP_SESSION_COOKIE_NAME to that name.")
+        elif label == "Session Redis":
+            hint = "Check the Redis settings below against the instance MISP writes its sessions to."
+        elif label == "MISP session" and expired:
+            hint = ("MISP's own timeout ended this session. Log in to MISP again in this browser "
+                    "and retry.")
+        elif label == "MISP session" and holding == _configured_db():
+            hint = ("MISP's sessions are in this Redis, so the plumbing is right and this one "
+                    "cookie has no session behind it. Log in to MISP again in this browser and "
+                    "retry: an expired or logged-out session leaves the cookie in place.")
+        elif label == "MISP session" and holding is not None:
+            hint = (f"MISP's sessions are in database {holding} of this Redis, not in database "
+                    f"{_configured_db()}. Set MISP_SESSION_REDIS_DB to {holding}. MISP's own "
+                    f"redis_database setting is a different one: PHP takes the session database "
+                    f"from session.save_path, which is 0 unless it says otherwise.")
+        elif label == "MISP session":
+            hint = ("Nothing is writing PHP sessions to this Redis. Set session.save_handler = redis "
+                    "and session.save_path in PHP, and check that session.save_path names the same "
+                    "instance and database as the Redis settings below.")
+    return {"checks": checks, "hint": hint}
+
+
+def login_redirect_url():
+    """MISP login URL to redirect to, or None if the request can proceed.
+
+    Only returns a URL when MISP_SESSION_REDIRECT_TO_LOGIN is enabled and no
+    valid MISP session was found for this request. The login page has to be the
+    one on the MISP zsazsa is served behind, whose session cookie the browser
+    sends, so it points at MISP_WEBAPP_URL rather than the scraper instance.
+    """
+    if not getattr(config, "MISP_SESSION_REDIRECT_TO_LOGIN", False):
+        return None
+    if getattr(g, "misp_user", None):
+        return None
+    return f"{config.MISP_WEBAPP_URL}/users/login"

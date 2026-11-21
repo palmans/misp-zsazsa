@@ -1,0 +1,584 @@
+{% extends "base.html" %}
+{% from "_macros.html" import galaxy_multiselect, tag_input %}
+
+{% block title %}Add manual entry | zsazsa CTI{% endblock %}
+{% block page_title %}Add manual collection entry{% endblock %}
+
+{% block topbar_actions %}
+<a href="{{ url_for('data_collection.newsletter_new') }}" class="btn btn-sm btn-outline-secondary">
+  <i class="fas fa-envelope-open-text me-1"></i> Import from newsletter
+</a>
+<a href="{{ url_for('data_collection.index') }}" class="btn btn-sm btn-outline-secondary ms-2">
+  <i class="fas fa-arrow-left me-1"></i> Back to collection
+</a>
+{% endblock %}
+
+{% block content %}
+{% set steps = [('source', 'Source'), ('article', 'Article'), ('scope', 'Scope'), ('references', 'References')] %}
+{% set reliability_names = {'A': 'Completely', 'B': 'Usually', 'C': 'Fairly', 'D': 'Rarely', 'E': 'Unreliable', 'F': 'Unknown'} %}
+{% set reliability_titles = {'A': 'Completely reliable', 'B': 'Usually reliable', 'C': 'Fairly reliable',
+                             'D': 'Not usually reliable', 'E': 'Unreliable', 'F': 'Reliability cannot be judged'} %}
+{% set credibility_names = {'1': 'Confirmed', '2': 'Probably', '3': 'Possibly', '4': 'Doubtful', '5': 'Improbable', '6': 'Unknown'} %}
+{% set credibility_titles = {'1': 'Confirmed by other sources', '2': 'Probably true', '3': 'Possibly true',
+                             '4': 'Doubtful', '5': 'Improbable', '6': 'Truth cannot be judged'} %}
+<section class="record-hero record-hero-compact rise mb-3">
+  <span class="hero-icon" aria-hidden="true"><i class="fas fa-pen-to-square"></i></span>
+  <div class="hero-main">
+    <p class="lead-text">A manual entry records intelligence that did not come in through a feed: a partner's message, a call, a report. Give the source reference first; fetching it fills the article.</p>
+    <nav class="form-steps" aria-label="Sections of the form">
+      {% for key, label in steps %}<a href="#step-{{ key }}">{{ loop.index }} {{ label }}</a>{% endfor %}
+    </nav>
+  </div>
+</section>
+
+<form method="post" data-unsaved-warning>
+  <div class="row g-4">
+
+    <div class="col-lg-8">
+
+      <div class="card content-card form-step mb-4" id="step-source" data-step='input[name="source"]'>
+        <div class="card-header d-flex align-items-center"><span class="step-num">1</span>Source</div>
+        <div class="card-body">
+          <span class="form-label d-block required-label">Source</span>
+          <div class="product-tiles source-tiles mb-1">
+            {% for s in manual_sources %}
+            <label class="product-tile" for="source-{{ loop.index }}">
+              <span class="tile-icon" aria-hidden="true"><i class="fas fa-inbox fa-fw"></i></span>
+              {{ s }}
+              <input class="form-check-input" type="radio" name="source" value="{{ s | e }}" id="source-{{ loop.index }}" required>
+            </label>
+            {% endfor %}
+          </div>
+          <div class="form-text mb-3">
+            Where this came from, such as a newsletter, a partner or a phone call. Not in the list? A site admin adds
+            manual sources under Settings, <a href="{{ url_for('collection_sources.index') }}">Collection sources</a>.
+          </div>
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label" for="source-provider">Provider</label>
+              <input type="text" name="source_provider" id="source-provider" class="form-control"
+                     placeholder="e.g. CTI Robot by ETDA Cyber Threat Intelligence">
+              <div class="form-text">The newsletter, partner or person within the source.</div>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="source_reference">Source reference</label>
+              <div class="input-group">
+                <input type="url" name="source_reference" id="source_reference" class="form-control font-monospace"
+                       placeholder="https://…">
+                <button type="button" class="btn btn-outline-primary" id="btn-fetch-url" title="Fetch the article and convert it to Markdown">
+                  <i class="fas fa-download me-1"></i>Fetch
+                </button>
+              </div>
+              <div class="form-text">The address of the article. Fetching it fills the content below.</div>
+              <div id="fetch-url-status" class="form-text" style="display:none"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card content-card form-step mb-4" id="step-article" data-step='input[name="title"], textarea[name="description"]'>
+        <div class="card-header d-flex align-items-center"><span class="step-num">2</span>Article</div>
+        <div class="card-body">
+          <div class="row g-3 mb-3">
+            <div class="col-md-9">
+              <label class="form-label required-label" for="entry-title">Title</label>
+              <input type="text" name="title" id="entry-title" class="form-control" required
+                     placeholder="Brief descriptive title for this event">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label" for="entry-date">Date</label>
+              <input type="date" name="date" id="entry-date" class="form-control" value="{{ today }}">
+            </div>
+          </div>
+
+          <div class="d-flex align-items-center justify-content-between mb-1">
+            <label class="form-label mb-0" for="description">Content</label>
+            <span class="md-tabs" role="group" aria-label="How to show the content">
+              <button type="button" id="md-tab-edit">Write</button>
+              <button type="button" id="md-tab-preview">Preview</button>
+              <button type="button" id="md-tab-split">Side by side</button>
+            </span>
+          </div>
+          <div id="md-panes" class="d-flex gap-2">
+            <div id="md-editor-pane" style="flex:1;">
+              <textarea name="description" id="description" class="form-control font-monospace" rows="14"
+                        placeholder="Article content in Markdown. Fetching the source reference fills this."></textarea>
+            </div>
+            <div id="md-preview-pane" class="border rounded p-3 report-md-body"
+                 style="flex:1;display:none;min-height:10rem;overflow-y:auto;"></div>
+          </div>
+          <div class="form-text mb-3">Markdown. Kept as the event report, so it reads the same in MISP.</div>
+
+          <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
+            <label class="form-label mb-0" for="summary">Summary</label>
+            <div class="zs-toolbar">
+              <span class="zs-toolbar-label">Fills</span>
+              <span class="ai-fills" id="ai-fills">
+                <a href="#summary" data-ai-targets="#summary"><i class="fas fa-align-left"></i>Summary</a>
+                <a href="#step-scope" data-ai-targets="#step-scope"><i class="fas fa-crosshairs"></i>Scope</a>
+              </span>
+              <button type="button" class="zs-pill" id="btn-llm-summary" data-ai-targets="#summary, #step-scope"
+                      title="Writes the summary from the content and ticks the scope items its MISP context names. Create the event before it is done and the summary still goes into it; the scope is only ticked on this page.">
+                <i class="fas fa-wand-magic-sparkles"></i>Build with AI
+              </button>
+            </div>
+          </div>
+          <textarea name="summary" id="summary" class="form-control" rows="3"
+                    placeholder="Two or three lines a reader of the briefing sees first. Leave it empty and ask for an AI summary."></textarea>
+          <div id="llm-summary-status" class="form-text" style="display:none"></div>
+        </div>
+      </div>
+
+      <div class="card content-card form-step mb-4" id="step-scope"
+           data-step='[name="geographic_scope"], [name="sectors"], [name="threat_actors"], [name="mitre_attack_techniques"], [name="threat_types"]'>
+        <div class="card-header d-flex align-items-center"><span class="step-num">3</span>Scope</div>
+        <div class="card-body">
+          <p class="small text-muted mb-3">What it is about, from the MISP galaxies. The scope decides which PIRs it answers and which briefing picks it up.</p>
+          <div class="scope-grid">
+            <div>
+              <label class="form-label">Geographic scope</label>
+              {{ galaxy_multiselect("geographic_scope", values=[], items=galaxy_countries) }}
+            </div>
+            <div>
+              <label class="form-label">Sectors</label>
+              {{ galaxy_multiselect("sectors", values=[], items=galaxy_sectors) }}
+            </div>
+            <div>
+              <label class="form-label">Threat actors</label>
+              {{ galaxy_multiselect("threat_actors", values=[], items=galaxy_threat_actors) }}
+            </div>
+            <div>
+              <label class="form-label">MITRE ATT&amp;CK techniques</label>
+              {{ galaxy_multiselect("mitre_attack_techniques", values=[], items=galaxy_mitre_attack) }}
+            </div>
+          </div>
+          <div class="mt-3">
+            <label class="form-label">Threat types</label>
+            {{ tag_input("threat_types", values=[], placeholder="e.g. Ransomware, Phishing, APT") }}
+          </div>
+        </div>
+      </div>
+
+      <div class="card content-card form-step mb-4" id="step-references" data-step='input[name="reference"]'>
+        <div class="card-header d-flex align-items-center"><span class="step-num">4</span>References</div>
+        <div class="card-body">
+          <div id="ref-list">
+            <div class="ref-row d-flex gap-2 mb-2">
+              <input type="text" name="reference" class="form-control font-monospace" placeholder="https://" aria-label="Reference">
+              <button type="button" class="btn btn-outline-danger ref-remove" title="Remove"><i class="fas fa-minus"></i></button>
+            </div>
+          </div>
+          <button type="button" class="btn btn-sm btn-outline-secondary mt-1" id="ref-add">
+            <i class="fas fa-plus me-1"></i> Add reference
+          </button>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="col-lg-4">
+      {# In the column rather than in its stack of cards, so it stays in view to the
+         end of the form as the stack scrolls away under it. #}
+      <div class="card content-card form-save mb-4">
+        <div class="card-header">As it will appear</div>
+        <div class="card-body d-flex flex-column gap-3">
+          <div class="form-preview">
+            <span class="monogram" aria-hidden="true"><i class="fas fa-pen-to-square"></i></span>
+            <div class="min-w-0">
+              <span class="req-id-badge">Manual entry</span>
+              <div class="form-preview-title" data-preview-text="title" data-empty="No title yet"></div>
+            </div>
+          </div>
+          <dl class="form-facts">
+            <dt>Source</dt><dd data-preview-choice="source" data-required data-empty="None picked yet"></dd>
+            <dt>Date</dt><dd data-preview-text="date" data-empty="Today"></dd>
+            <dt>TLP</dt><dd data-preview-choice="tlp"></dd>
+            <dt>Admiralty</dt><dd id="admiralty-preview" class="text-muted">Not rated</dd>
+          </dl>
+          <input type="hidden" name="summary_job" id="summary-job" autocomplete="off">
+          <div class="d-flex gap-2">
+            <button type="submit" class="btn btn-primary flex-grow-1" id="create-event-btn">
+              <i class="fas fa-floppy-disk me-1"></i> Create event
+            </button>
+            <a href="{{ url_for('data_collection.index') }}" class="btn btn-outline-secondary">Cancel</a>
+          </div>
+          <div class="form-text text-center mt-0" id="create-event-wait" hidden>
+            <i class="fas fa-spinner fa-spin me-1"></i>The AI summary is still being written.
+            It goes into the event when it is done.
+          </div>
+          <div class="form-text mt-0">Creates a MISP event on the webapp server. Attachments are added on its page after saving.</div>
+        </div>
+      </div>
+
+      <div class="d-flex flex-column gap-4">
+      <div class="card content-card">
+        <div class="card-header"><i class="fas fa-sliders me-2"></i>Classification</div>
+        <div class="card-body">
+          <span class="form-label d-block">TLP</span>
+          <div class="choice-group" role="radiogroup" aria-label="TLP">
+            {% for t in tlp_levels %}
+            <input class="btn-check" type="radio" name="tlp" value="{{ t }}" id="entry-tlp-{{ loop.index }}" {{ 'checked' if t == 'green' }}>
+            <label class="choice" for="entry-tlp-{{ loop.index }}"><span class="tlp-badge tlp-{{ t | slug }}">TLP:{{ t | upper }}</span></label>
+            {% endfor %}
+          </div>
+          <hr class="my-3">
+          {% for name, label, values, names, titles in [
+               ('source_reliability', 'Source reliability', reliabilities, reliability_names, reliability_titles),
+               ('information_credibility', 'Information credibility', credibilities, credibility_names, credibility_titles)] %}
+          <div class="d-flex align-items-baseline justify-content-between">
+            <span class="form-label">{{ label }}</span>
+            <button type="button" class="btn btn-link btn-sm p-0 admiralty-clear" data-field="{{ name }}">Not rated</button>
+          </div>
+          <div class="choice-group admiralty mb-3" role="radiogroup" aria-label="{{ label }}">
+            {% for v in values %}
+            <input class="btn-check" type="radio" name="{{ name }}" value="{{ v }}" id="{{ name }}-{{ v }}">
+            <label class="choice" for="{{ name }}-{{ v }}" title="{{ titles.get(v, v) }}"><b>{{ v }}</b><small>{{ names.get(v, '') }}</small></label>
+            {% endfor %}
+          </div>
+          {% endfor %}
+          <div class="form-text mt-0">Saved on the event as admiralty-scale tags.</div>
+        </div>
+      </div>
+      </div>
+    </div>
+
+  </div>
+</form>
+{% endblock %}
+
+{% block scripts %}
+{% include "_markdown_js.html" %}
+{% include "_ai_targets_js.html" %}
+{% include "_form_steps_js.html" %}
+{% include "requirements/_form_preview_js.html" %}
+<script>
+/* The Admiralty code in "As it will appear", such as B2, and the buttons that
+   take a rating off again. */
+(function() {
+  var preview = document.getElementById('admiralty-preview');
+  var names = {source_reliability: 'reliability', information_credibility: 'credibility'};
+  function picked(name) {
+    var box = document.querySelector('input[name="' + name + '"]:checked');
+    return box ? box.value : '';
+  }
+  function show() {
+    var code = picked('source_reliability') + picked('information_credibility');
+    preview.replaceChildren();
+    preview.classList.toggle('text-muted', !code);
+    if (!code) { preview.textContent = 'Not rated'; return; }
+    var badge = document.createElement('span');
+    badge.className = 'admiralty-code';
+    badge.textContent = code;
+    preview.appendChild(badge);
+  }
+  document.querySelectorAll('.admiralty-clear').forEach(function(btn) {
+    btn.setAttribute('aria-label', 'No ' + names[btn.dataset.field] + ' rating');
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('input[name="' + btn.dataset.field + '"]').forEach(function(box) { box.checked = false; });
+      show();
+    });
+  });
+  document.querySelectorAll('.admiralty input').forEach(function(box) { box.addEventListener('change', show); });
+  show();
+})();
+</script>
+<script>
+function tiRender(field) {
+  var display = document.getElementById('ti-display-' + field);
+  var store   = document.getElementById('ti-store-' + field);
+  if (!display || !store) return;
+  display.innerHTML = '';
+  store.querySelectorAll('input[type="hidden"]').forEach(function(inp) {
+    var pill = document.createElement('span');
+    pill.className = 'tag-pill';
+    var txt = document.createTextNode(inp.value);
+    var btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'tag-pill-remove'; btn.textContent = '×'; btn.title = 'Remove';
+    btn.onclick = function() { inp.remove(); tiRender(field); };
+    pill.appendChild(txt); pill.appendChild(btn);
+    display.appendChild(pill);
+  });
+}
+function tiAdd(field) {
+  var text  = document.getElementById('ti-text-' + field);
+  var store = document.getElementById('ti-store-' + field);
+  if (!text || !store) return;
+  var val = text.value.trim();
+  if (!val) return;
+  var existing = Array.from(store.querySelectorAll('input[type="hidden"]')).map(function(i){ return i.value; });
+  if (!existing.includes(val)) {
+    var h = document.createElement('input');
+    h.type = 'hidden'; h.name = field; h.value = val;
+    store.appendChild(h);
+    tiRender(field);
+  }
+  text.value = ''; text.focus();
+}
+document.addEventListener('DOMContentLoaded', function() {
+  document.querySelectorAll('[data-ti-field]').forEach(function(w) {
+    var f = w.dataset.tiField;
+    tiRender(f);
+    var t = document.getElementById('ti-text-' + f);
+    w.querySelector('.ti-add').addEventListener('click', function() { tiAdd(f); });
+    if (t) t.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); tiAdd(f); }
+    });
+  });
+});
+</script>
+<script>
+(function() {
+  // Markdown editor tabs
+  var editTab     = document.getElementById('md-tab-edit');
+  var previewTab  = document.getElementById('md-tab-preview');
+  var splitTab    = document.getElementById('md-tab-split');
+  var editorPane  = document.getElementById('md-editor-pane');
+  var previewPane = document.getElementById('md-preview-pane');
+  var descTA      = document.getElementById('description');
+  var currentMode = 'edit';
+
+  function renderPreview() {
+    var raw = descTA.value;
+    zsazsaRenderMarkdown(previewPane, raw, '<em class="text-muted">Nothing to preview.</em>');
+  }
+
+  function setTab(mode) {
+    currentMode = mode;
+    var active = mode === 'edit' ? editTab : mode === 'preview' ? previewTab : splitTab;
+    [editTab, previewTab, splitTab].forEach(function(b) {
+      b.classList.toggle('on', b === active);
+      b.setAttribute('aria-pressed', b === active ? 'true' : 'false');
+    });
+
+    if (mode === 'edit') {
+      editorPane.style.display  = '';
+      previewPane.style.display = 'none';
+    } else if (mode === 'preview') {
+      editorPane.style.display  = 'none';
+      previewPane.style.display = '';
+      renderPreview();
+    } else {
+      editorPane.style.display  = '';
+      previewPane.style.display = '';
+      renderPreview();
+    }
+    previewPane.style.height = mode === 'split' ? descTA.offsetHeight + 'px' : '';
+  }
+
+  // Side by side, the preview keeps the editor's height, also when the editor
+  // is resized, and scrolls; on its own it is as long as its content.
+  new ResizeObserver(function() {
+    if (currentMode === 'split') previewPane.style.height = descTA.offsetHeight + 'px';
+  }).observe(descTA);
+
+  editTab.addEventListener('click', function() { setTab('edit'); });
+  previewTab.addEventListener('click', function() { setTab('preview'); });
+  splitTab.addEventListener('click', function() { setTab('split'); });
+  setTab('edit');
+
+  // Live preview update when in preview/split mode
+  descTA.addEventListener('input', function() {
+    if (currentMode === 'preview' || currentMode === 'split') renderPreview();
+  });
+
+  // External references
+  var refList = document.getElementById('ref-list');
+  document.getElementById('ref-add').addEventListener('click', function() {
+    var row = document.createElement('div');
+    row.className = 'ref-row d-flex gap-2 mb-2';
+    row.innerHTML = '<input type="text" name="reference" class="form-control form-control-sm font-monospace" placeholder="https://">'
+      + '<button type="button" class="btn btn-sm btn-outline-danger ref-remove"><i class="fas fa-minus"></i></button>';
+    refList.appendChild(row);
+  });
+  refList.addEventListener('click', function(e) {
+    var btn = e.target.closest('.ref-remove');
+    if (btn) {
+      btn.closest('.ref-row').remove();
+      markRepeatedReferences();
+    }
+  });
+
+  /* A URL already given as the source reference or in an earlier row is saved
+     only once, so say so next to the repeat rather than leave it unexplained.
+     Compared after trimming, as the save compares them. */
+  var sourceRef = document.getElementById('source_reference');
+  function markRepeatedReferences() {
+    refList.querySelectorAll('.ref-dup-note').forEach(function(n) { n.remove(); });
+    var seen = {};
+    var source = sourceRef.value.trim();
+    if (source) seen[source] = 'This is the source reference already, so it is saved once.';
+    refList.querySelectorAll('.ref-row').forEach(function(row) {
+      var input = row.querySelector('input[name="reference"]');
+      var value = input.value.trim();
+      var repeat = value && seen[value];
+      input.classList.toggle('border-warning', !!repeat);
+      if (repeat) {
+        var note = document.createElement('div');
+        note.className = 'ref-dup-note form-text text-warning mb-2';
+        note.textContent = repeat;
+        row.after(note);
+      } else if (value) {
+        seen[value] = 'This URL is listed above already, so it is saved once.';
+      }
+    });
+  }
+  refList.addEventListener('input', markRepeatedReferences);
+  sourceRef.addEventListener('input', markRepeatedReferences);
+
+  // Bootstrap tooltips
+  document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function(el) {
+    new bootstrap.Tooltip(el);
+  });
+})();
+</script>
+<script>
+(function() {
+  var csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+
+  document.getElementById('btn-fetch-url').addEventListener('click', function() {
+    var url = document.getElementById('source_reference').value.trim();
+    if (!url) return;
+    var status = document.getElementById('fetch-url-status');
+    var btn = this;
+    status.textContent = 'Fetching…';
+    status.className = 'form-text';
+    status.style.display = '';
+    btn.disabled = true;
+    fetch(SCRIPT_ROOT + '/api/fetch-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+      body: JSON.stringify({ url: url })
+    })
+    .then(zsazsaReadJson)
+    .then(function(data) {
+      if (data.error) {
+        status.textContent = 'Error: ' + data.error;
+        status.className = 'form-text text-danger';
+      } else {
+        document.getElementById('description').value = data.content || '';
+        document.getElementById('description').dispatchEvent(new Event('input', {bubbles: true}));
+        var titleInput = document.querySelector('input[name="title"]');
+        if (titleInput && !titleInput.value.trim() && data.title) {
+          titleInput.value = data.title;
+          titleInput.dispatchEvent(new Event('input', {bubbles: true}));
+        }
+        status.textContent = 'Content loaded.';
+        status.className = 'form-text text-success';
+      }
+      btn.disabled = false;
+    })
+    .catch(function(err) {
+      status.textContent = 'Could not fetch the page: ' + zsazsaErrorText(err);
+      status.className = 'form-text text-danger';
+      btn.disabled = false;
+    });
+  });
+
+  /* Tick what the summary's "MISP context" names, in the pickers that hold it:
+     a name by its galaxy value, a technique by the T-number its value ends in.
+     Returns how many were ticked; a name the galaxy does not have is left out,
+     as it would get no tag on saving either. */
+  function tickScope(scope) {
+    var lower = function(names) { return (names || []).map(function(n) { return n.trim().toLowerCase(); }); };
+    var fields = {
+      geographic_scope: lower(scope.geographies),
+      sectors: lower(scope.sectors),
+      threat_actors: lower(scope.threat_actors),
+    };
+    var techniques = scope.attack_techniques || [];
+    var ticked = 0;
+    document.querySelectorAll('.gms-list input[type="checkbox"]').forEach(function(cb) {
+      var match = cb.name === 'mitre_attack_techniques'
+        ? techniques.indexOf((cb.value.match(/T\d{4}(?:\.\d{3})?$/) || [''])[0]) !== -1
+        : (fields[cb.name] || []).indexOf(cb.value.trim().toLowerCase()) !== -1;
+      if (match && !cb.checked) {
+        cb.checked = true;
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+        ticked++;
+      }
+    });
+    return ticked;
+  }
+
+  var aiBtn = document.getElementById('btn-llm-summary');
+  aiBtn.addEventListener('click', function() {
+    var content = document.getElementById('description').value.trim();
+    var status = document.getElementById('llm-summary-status');
+    var btn = this;
+    if (!content) {
+      status.textContent = 'Add content first.';
+      status.className = 'form-text text-warning';
+      status.style.display = '';
+      return;
+    }
+    var titleInput = document.querySelector('input[name="title"]');
+    var title = titleInput ? titleInput.value.trim() : '';
+    var summary = document.getElementById('summary');
+    var createBtn = document.getElementById('create-event-btn');
+    var createWait = document.getElementById('create-event-wait');
+    var summaryJob = document.getElementById('summary-job');
+    var originalHtml = btn.innerHTML;
+    status.textContent = 'Queueing summary…';
+    status.className = 'form-text';
+    status.style.display = '';
+
+    /* The summary is written into the box below when the job is done, so the
+       box is locked meanwhile. The event can still be created: the form then
+       names the job, and the server has it write the summary into the event.
+       Creating it asks first, since the summary is not in the box yet. */
+    function busy(on) {
+      btn.disabled = on;
+      btn.innerHTML = on ? '<i class="fas fa-spinner fa-spin"></i>Building…' : originalHtml;
+      summary.readOnly = on;
+      zsazsaAiTargets(btn, on);
+      createWait.hidden = !on;
+      if (on) {
+        createBtn.dataset.submitConfirm = 'The AI summary is still being written. Create the event now? '
+                                        + 'The summary goes into it when it is done.';
+      } else {
+        delete createBtn.dataset.submitConfirm;
+        summaryJob.value = '';
+      }
+    }
+    busy(true);
+
+    function fail(message) {
+      status.textContent = message;
+      status.className = 'form-text text-danger';
+      busy(false);
+    }
+
+    fetch(SCRIPT_ROOT + '/api/summarise-content', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+      body: JSON.stringify({ content: content, title: title })
+    })
+    .then(zsazsaReadJson)
+    .then(function(data) {
+      if (!data.ok) {
+        fail('Error: ' + (data.error || 'unknown error'));
+        return;
+      }
+      // The summary runs as a job, so the top bar shows it straight away and
+      // keeps reporting even if this page is left before the model answers.
+      if (window.zsazsaJobsChanged) zsazsaJobsChanged();
+      status.textContent = 'Generating summary… (job ' + data.job_id.slice(0, 8) + ')';
+      summaryJob.value = data.job_id;
+      zsazsaFollowJob(data.job_id, function(job) {
+        var result = job.result || {};
+        summary.value = result.summary || '';
+        var ticked = tickScope(result.scope || {});
+        status.textContent = ticked
+          ? 'Summary generated. ' + ticked + ' scope item' + (ticked === 1 ? '' : 's') + ' from its MISP context ticked under Scope.'
+          : 'Summary generated.';
+        status.className = 'form-text text-success';
+        busy(false);
+      }, fail);
+    })
+    .catch(function(err) {
+      fail('Summary did not complete: ' + zsazsaErrorText(err));
+    });
+  });
+})();
+</script>
+{% endblock %}

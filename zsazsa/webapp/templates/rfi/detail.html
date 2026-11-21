@@ -1,0 +1,455 @@
+{% extends "base.html" %}
+{% from "_macros.html" import lifecycle, product_icon %}
+
+{% block title %}{{ rfi.rfi_id }} | zsazsa CTI{% endblock %}
+{% block page_title %}{{ rfi.rfi_id }}{% endblock %}
+
+{% block misp_object_url %}{{ rfi.misp_url }}{% endblock %}
+{% block topbar_actions %}
+<a href="{{ url_for('rfi.rfi_list') }}" class="btn btn-sm btn-light border shadow-sm">
+  <i class="fas fa-arrow-left me-1"></i> Back to list
+</a>
+{% endblock %}
+
+{% block content %}
+<style>
+  .rfi-route { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-top: .8rem; font-size: .84rem; }
+  .rfi-route .party { display: flex; flex-direction: column; padding: .4rem .7rem; border-radius: 10px;
+                      border: 1px solid rgba(255,255,255,.3); background: rgba(255,255,255,.1); }
+  .rfi-route .party span { font-size: .66rem; letter-spacing: .08em; text-transform: uppercase; opacity: .8; }
+  .rfi-track { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .3rem; max-width: 34rem; margin-top: .9rem; }
+  .rfi-track div { padding-top: .35rem; border-top: 3px solid rgba(255,255,255,.25); font-size: .72rem; opacity: .75; }
+  .rfi-track div.done { border-top-color: rgba(255,255,255,.7); opacity: .95; }
+  .rfi-track div.now { border-top-color: #fff; font-weight: 700; opacity: 1; }
+  .record-hero-compact .rfi-route { gap: .4rem; margin-top: 0; font-size: .76rem; }
+  .record-hero-compact .rfi-route .party { flex-direction: row; align-items: baseline; gap: .35rem; padding: .15rem .55rem; }
+  .record-hero-compact .rfi-route .party span { font-size: .58rem; }
+  .record-hero-compact .rfi-track { flex: 1 1 18rem; margin-top: 0; }
+  .record-hero-compact .rfi-track div { padding-top: .2rem; font-size: .64rem; }
+</style>
+{% set rfi_statuses = ['New', 'Acknowledged', 'In Progress', 'Delivered', 'Closed'] %}
+{% set at = rfi_statuses.index(rfi.status) if rfi.status in rfi_statuses else -1 %}
+
+<section class="record-hero record-hero-compact record-hero-detail rise mb-3">
+  <div class="hero-body">
+    <div class="hero-main">
+      <div class="d-flex flex-wrap gap-2 align-items-center">
+        <span class="hero-id"><i class="fas fa-circle-question me-1"></i>{{ rfi.rfi_id }}</span>
+        <span class="badge status-badge status-{{ rfi.status | slug }}">{{ rfi.status }}</span>
+        <span class="badge priority-badge priority-{{ {'High': 'must-have', 'Medium': 'should-have', 'Low': 'could-have'}.get(rfi.priority, 'should-have') }}">{{ rfi.priority }} priority</span>
+        {% if auto_acknowledged %}
+        <span class="hero-tag" title="RFI was automatically acknowledged after stakeholder notification">Auto-acknowledged</span>
+        {% endif %}
+      </div>
+      <div class="rfi-route">
+        <div class="party"><span>Asked by</span>{{ rfi.requester_name or 'No requester' }}{% if rfi.requester_team %} · {{ rfi.requester_team }}{% endif %}</div>
+        <i class="fas fa-arrow-right" aria-hidden="true"></i>
+        <div class="party"><span>Assigned to</span>{{ rfi.assigned_analyst or 'Nobody yet' }}</div>
+      </div>
+      <h1 class="question">{{ rfi.question | md_inline }}</h1>
+      <div class="rfi-track" aria-label="Status: {{ rfi.status }}">
+        {% for s in rfi_statuses %}<div class="{{ 'now' if loop.index0 == at else ('done' if loop.index0 < at) }}">{{ s }}</div>{% endfor %}
+      </div>
+    </div>
+    <div class="hero-actions">
+      <a href="{{ url_for('rfi.rfi_edit', id=rfi.id) }}" class="btn btn-sm btn-hero"><i class="fas fa-pen me-1"></i> Edit</a>
+      {% if rfi.status != 'New' %}
+      <button type="button" class="btn btn-sm btn-hero-ghost" id="notify-btn"
+              data-notify-url="{{ url_for('rfi.rfi_notify', id=rfi.id) }}">
+        <i class="fas fa-bell me-1"></i> Notify stakeholders
+      </button>
+      {% else %}
+      <span class="small align-self-center"><i class="fas fa-gavel me-1"></i>Triage this RFI before notifying.</span>
+      {% endif %}
+      <form method="post" action="{{ url_for('rfi.rfi_delete', id=rfi.id) }}"
+            data-submit-confirm="Delete {{ rfi.rfi_id }}?" class="d-inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-sm btn-hero-ghost"><i class="fas fa-trash me-1"></i> Delete</button>
+      </form>
+    </div>
+  </div>
+  <div class="hero-block{{ ' late' if sla_state == 'red' }}">
+    <span>Service level</span>
+    {% if sla_state == 'done' %}
+    <b>Done</b>
+    {% elif days_remaining is none %}
+    <b>-</b><span>no due date</span>
+    {% elif days_remaining < 0 %}
+    <b>{{ -days_remaining }}</b><span>day{{ 's' if days_remaining != -1 }} past the due date</span>
+    {% else %}
+    <b>{{ days_remaining }}</b><span>day{{ 's' if days_remaining != 1 }} left</span>
+    {% endif %}
+    {% if rfi.due_date %}<span>due {{ rfi.due_date.strftime('%d-%m-%Y') }}</span>{% endif %}
+  </div>
+</section>
+
+<div class="row g-4">
+  <div class="col-lg-8">
+
+    {% if rfi.context %}
+    <div class="card content-card mb-4 rise rise-1">
+      <div class="card-header"><i class="fas fa-circle-info me-2"></i>Context</div>
+      <div class="card-body">
+        <div class="report-md-body" data-md="{{ rfi.context | e }}"></div>
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="card content-card mb-4 rise rise-1">
+      <div class="card-header d-flex align-items-center justify-content-between">
+        <span><i class="fas fa-paper-plane me-2"></i>Response</span>
+        <span class="d-flex align-items-center gap-2">
+          {% if rfi.response_confidence %}
+          <span class="badge bg-secondary" title="Confidence in the analytic judgment (estimative language)">
+            Confidence: {{ rfi.response_confidence | capitalize }}
+          </span>
+          {% endif %}
+          {% if rfi.status != 'New' %}
+          <button type="button" class="btn btn-xs btn-outline-secondary" title="Edit the response"
+                  data-bs-toggle="collapse" data-bs-target=".rfi-response-part" aria-expanded="false">
+            <i class="fas fa-pen"></i>
+          </button>
+          {% endif %}
+        </span>
+      </div>
+      <div class="card-body collapse show rfi-response-part">
+        {% if rfi.response %}
+        <div class="report-md-body" data-md="{{ rfi.response | e }}"></div>
+        {% else %}
+        <p class="text-muted mb-0"><em>No response recorded yet.</em></p>
+        {% endif %}
+      </div>
+      {% if rfi.status != 'New' %}
+      <form method="post" action="{{ url_for('rfi.rfi_response', id=rfi.id) }}"
+            class="card-body collapse rfi-response-part" data-unsaved-warning>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        {% with is_edit=true, triaged=true %}{% include "rfi/_response_fields.html" %}{% endwith %}
+        <div class="d-flex gap-2 justify-content-end mt-3">
+          {# A reload rather than a collapse: hiding the form would keep its
+             edits, and leaving the page later would ask about them. #}
+          <a href="{{ url_for('rfi.rfi_detail', id=rfi.id) }}" class="btn btn-sm btn-outline-secondary">Cancel</a>
+          <button type="submit" class="btn btn-sm btn-primary"><i class="fas fa-floppy-disk me-1"></i>Save response</button>
+        </div>
+      </form>
+      {% endif %}
+    </div>
+
+    {% include "rfi/_attachments_notes.html" %}
+
+    <div class="card content-card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="fas fa-comment-dots me-2"></i>Feedback</span>
+        {% if rfi.status == 'Closed' %}
+        <button class="btn btn-sm btn-outline-primary" type="button"
+                data-bs-toggle="collapse" data-bs-target="#feedback-form-collapse">
+          <i class="fas fa-pen me-1"></i> Submit feedback
+        </button>
+        {% endif %}
+      </div>
+      <div class="card-body">
+        <table class="table table-sm mb-0">
+          <tbody>
+            <tr>
+              <th style="width:40%">Met the requirement?</th>
+              <td>{{ rfi.feedback_requirement_met or '-' }}</td>
+            </tr>
+            <tr>
+              <th>Delivered on time?</th>
+              <td>{{ rfi.feedback_on_time or '-' }}</td>
+            </tr>
+            <tr>
+              <th>Usefulness</th>
+              <td>{{ rfi.feedback_usefulness or '-' }}</td>
+            </tr>
+            <tr>
+              <th>Suggestions</th>
+              <td>{{ rfi.feedback_suggestions or '-' }}</td>
+            </tr>
+          </tbody>
+        </table>
+
+        {% if rfi.status == 'Closed' %}
+        <div class="collapse mt-3" id="feedback-form-collapse">
+          <hr>
+          <form method="post" action="{{ url_for('rfi.rfi_feedback', id=rfi.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="mb-2">
+              <label class="form-label small fw-semibold">Met the requirement?</label>
+              <select name="feedback_requirement_met" class="form-select form-select-sm">
+                <option value="">- select -</option>
+                {% for v in feedback_requirement %}
+                <option value="{{ v }}" {% if rfi.feedback_requirement_met == v %}selected{% endif %}>{{ v }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="mb-2">
+              <label class="form-label small fw-semibold">Delivered on time?</label>
+              <select name="feedback_on_time" class="form-select form-select-sm">
+                <option value="">- select -</option>
+                {% for v in feedback_on_time %}
+                <option value="{{ v }}" {% if rfi.feedback_on_time == v %}selected{% endif %}>{{ v }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="mb-2">
+              <label class="form-label small fw-semibold">Usefulness</label>
+              <select name="feedback_usefulness" class="form-select form-select-sm">
+                <option value="">- select -</option>
+                {% for v in feedback_usefulness %}
+                <option value="{{ v }}" {% if rfi.feedback_usefulness == v %}selected{% endif %}>{{ v }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="mb-3">
+              <label class="form-label small fw-semibold">Suggestions</label>
+              <textarea name="feedback_suggestions" class="form-control form-control-sm" rows="3">{{ rfi.feedback_suggestions or '' }}</textarea>
+            </div>
+            <button type="submit" class="btn btn-primary btn-sm w-100">
+              <i class="fas fa-save me-1"></i> Save feedback
+            </button>
+          </form>
+        </div>
+        {% endif %}
+
+        {% if feedback %}
+        <hr>
+        <p class="small fw-semibold text-muted mb-2"><i class="fas fa-message me-1"></i>Analyst feedback notes</p>
+        {% for f in feedback %}
+        <div class="border rounded p-2 mb-2 small">
+          <div class="text-muted mb-1">{{ f.name }}</div>
+          <div class="report-md-body" data-md="{{ f.content | e }}"></div>
+        </div>
+        {% endfor %}
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-4">
+    <div class="card content-card mb-4 rise rise-1">
+      <div class="card-header"><i class="fas fa-route me-2"></i>Lifecycle</div>
+      <div class="card-body">
+        {% set status_url = url_for('rfi.rfi_status_update', id=rfi.id) %}
+        {% if rfi.status == 'New' %}
+        {{ lifecycle(rfi.rfi_id, rfi.status, rfi_statuses, [], status_url, 'A new RFI leaves New through triage.') }}
+        <a href="{{ url_for('rfi.rfi_list', triage=rfi.id) }}" class="btn btn-xs btn-outline-warning mt-2"><i class="fas fa-gavel me-1"></i>Triage it on the RFI list</a>
+        {% else %}
+        {{ lifecycle(rfi.rfi_id, rfi.status, rfi_statuses, rfi_statuses | reject('equalto', 'New') | list, status_url) }}
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card content-card mb-4">
+      <div class="card-header"><i class="fas fa-info-circle me-2"></i>Details</div>
+      <div class="card-body">
+        <dl class="row small mb-0">
+          <dt class="col-5">Requester</dt>
+          <dd class="col-7">{{ rfi.requester_name or '-' }}{% if rfi.requester_team %}<br><span class="text-muted">{{ rfi.requester_team }}</span>{% endif %}</dd>
+
+          <dt class="col-5">Stakeholder</dt>
+          <dd class="col-7">{{ rfi.owner_name or '-' }}</dd>
+
+          <dt class="col-5">Assigned to</dt>
+          <dd class="col-7">{{ rfi.assigned_analyst or '-' }}</dd>
+
+          <dt class="col-5">Due date</dt>
+          <dd class="col-7">
+            {{ rfi.due_date.strftime('%d-%m-%Y') if rfi.due_date else '-' }}
+            {% if days_remaining is not none and sla_state != 'done' %}
+              {% if sla_state == 'red' %}
+                <span class="badge text-bg-danger ms-1">Overdue {{ -days_remaining }}d</span>
+              {% elif sla_state == 'amber' %}
+                <span class="badge text-bg-warning ms-1">{{ days_remaining }}d left</span>
+              {% else %}
+                <span class="badge text-bg-success ms-1">{{ days_remaining }}d left</span>
+              {% endif %}
+            {% endif %}
+          </dd>
+
+          <dt class="col-5">Preferred output formats</dt>
+          <dd class="col-7">
+            {% if rfi.output_format_list %}
+            {% for item in rfi.output_format_list %}
+            <div>{{ product_icon(item.format) }}{{ item.format }} <span class="tlp-badge tlp-{{ item.tlp | slug }} ms-1">TLP:{{ item.tlp | upper }}</span></div>
+            {% endfor %}
+            {% else %}
+            -
+            {% endif %}
+          </dd>
+
+          <dt class="col-5">Created</dt>
+          <dd class="col-7">{{ rfi.created_at.strftime('%d-%m-%Y') if rfi.created_at else '-' }}</dd>
+
+          <dt class="col-5">Created by</dt>
+          <dd class="col-7">{{ rfi.creator or '-' }}</dd>
+
+          {% if rfi.history_url %}
+          <dt class="col-5">History</dt>
+          <dd class="col-7">
+            <a href="{{ rfi.history_url }}" target="_blank" rel="noopener" class="text-decoration-none">
+              <i class="fas fa-clock-rotate-left me-1"></i>MISP event history
+            </a>
+          </dd>
+          {% endif %}
+        </dl>
+      </div>
+    </div>
+
+    {% if rfi.triaged %}
+    <div class="card content-card mb-4">
+      <div class="card-header"><i class="fas fa-clipboard-list me-2"></i>Intake</div>
+      <div class="card-body small">
+        <dl class="detail-list mb-0">
+          {% if rfi.triaged_at %}
+          <dt>Triaged</dt><dd>{{ rfi.triaged_at }}{% if rfi.triaged_by %} <span class="text-muted">by {{ rfi.triaged_by }}</span>{% endif %}</dd>
+          {% endif %}
+          {% if rfi.rejection_reason %}
+          <dt>Rejection reason</dt><dd>{{ rfi.rejection_reason }}</dd>
+          {% endif %}
+          <dt class="mt-2">Triage checklist</dt>
+          <dd>
+            <ul class="list-unstyled mb-0">
+              {% for key, label in triage_checklist %}
+              <li class="{{ 'text-success' if key in rfi.triage_checklist else 'text-muted' }}" style="font-size:.8rem;">
+                <i class="fas {{ 'fa-check-circle' if key in rfi.triage_checklist else 'fa-circle' }} me-1" style="font-size:.7rem;"></i>{{ label }}
+              </li>
+              {% endfor %}
+            </ul>
+          </dd>
+        </dl>
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="card content-card mb-4">
+      <div class="card-header"><i class="fas fa-link me-2"></i>Linked requirements</div>
+      <div class="card-body">
+        {% if linked_pir %}
+        <p class="mb-2">
+          <span class="text-muted small">PIR:</span>
+          <a href="{{ url_for('requirements.pir_detail', id=linked_pir.id) }}" class="text-decoration-none">
+            <span class="req-id-badge">{{ linked_pir.pir_id }}</span> {{ linked_pir.question | truncate(60) }}
+          </a>
+        </p>
+        {% endif %}
+        {% if linked_gir %}
+        <p class="mb-2">
+          <span class="text-muted small">GIR:</span>
+          <a href="{{ url_for('requirements.gir_detail', id=linked_gir.id) }}" class="text-decoration-none">
+            <span class="req-id-badge">{{ linked_gir.gir_id }}</span> {{ linked_gir.topic | truncate(60) }}
+          </a>
+        </p>
+        {% endif %}
+        {% if not linked_pir and not linked_gir %}
+        <p class="text-muted small mb-0"><em>No PIR or GIR linked. Recurring RFIs may indicate a missing standing requirement.</em></p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Notify stakeholders modal -->
+<div class="modal fade" id="notify-modal" tabindex="-1" aria-labelledby="notify-modal-label" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="notify-modal-label"><i class="fas fa-bell me-2"></i>Notify stakeholders</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p class="text-muted small mb-2">Preview the notification that will be sent. You can edit it before sending.</p>
+        <textarea class="form-control font-monospace" id="notify-markdown" rows="20" style="font-size:.8rem;"></textarea>
+        <div id="notify-diagnostics" class="small text-muted mt-2"></div>
+        <div id="notify-status" class="mt-2"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-warning" id="notify-send-btn">
+          <i class="fas fa-paper-plane me-1"></i> Send notification
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% include "_markdown_js.html" %}
+{% include "_status_move_js.html" %}
+<script>
+(function() {
+  document.querySelectorAll('.report-md-body[data-md]').forEach(function(el) {
+    zsazsaRenderMarkdown(el, el.getAttribute('data-md'));
+    el.removeAttribute('data-md');
+  });
+})();
+(function() {
+  // A new RFI has no Notify button until it is triaged.
+  var btn = document.getElementById('notify-btn');
+  if (!btn) return;
+  var modal = new bootstrap.Modal(document.getElementById('notify-modal'));
+  var textarea = document.getElementById('notify-markdown');
+  var diagnosticsEl = document.getElementById('notify-diagnostics');
+  var statusEl = document.getElementById('notify-status');
+  var sendBtn = document.getElementById('notify-send-btn');
+  var notifyUrl = btn.dataset.notifyUrl;
+
+  btn.addEventListener('click', function() {
+    textarea.value = 'Loading…';
+    statusEl.innerHTML = '';
+    if (diagnosticsEl) diagnosticsEl.textContent = '';
+    modal.show();
+    fetch(notifyUrl, {headers: {'Accept': 'application/json'}})
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        textarea.value = data.markdown || '';
+        if (diagnosticsEl) {
+          var names = (data.recipient_names || []).slice(0, 6).join(', ');
+          var extra = (data.recipient_names || []).length > 6 ? ' +' + ((data.recipient_names || []).length - 6) + ' more' : '';
+          var channels = Object.entries(data.channels_by_type || {}).map(function(entry) {
+            return entry[0] + ': ' + entry[1];
+          }).join(', ');
+          diagnosticsEl.textContent =
+            'Eligible recipients: ' + (data.recipient_count || 0) +
+            (names ? ' (' + names + extra + ')' : '') +
+            (channels ? ' | Channels: ' + channels : ' | Channels: none configured');
+        }
+      })
+      .catch(function(e) { textarea.value = 'Error loading preview: ' + e; });
+  });
+
+  sendBtn.addEventListener('click', function() {
+    var csrf = document.querySelector('meta[name="csrf-token"]');
+    var headers = {'Content-Type': 'application/x-www-form-urlencoded'};
+    if (csrf) headers['X-CSRF-Token'] = csrf.content;
+    statusEl.innerHTML = '<span class="text-muted small">Sending…</span>';
+    sendBtn.disabled = true;
+    fetch(notifyUrl, {
+      method: 'POST',
+      headers: headers,
+      body: 'markdown=' + encodeURIComponent(textarea.value)
+    }).then(function(r) {
+      if (r.redirected || r.ok) {
+        modal.hide();
+        window.location.reload();
+      } else {
+        return r.text().then(function(t) {
+          var sp = document.createElement('span');
+          sp.className = 'text-danger small';
+          sp.textContent = 'Error: ' + t;
+          statusEl.replaceChildren(sp);
+          sendBtn.disabled = false;
+        });
+      }
+    }).catch(function(e) {
+      var sp = document.createElement('span');
+      sp.className = 'text-danger small';
+      sp.textContent = 'Error: ' + e;
+      statusEl.replaceChildren(sp);
+      sendBtn.disabled = false;
+    });
+  });
+})();
+</script>
+{% include "rfi/_response_fields_js.html" %}
+{% endblock %}

@@ -1,0 +1,386 @@
+# MISP + misp-scraper + zsazsa on Docker
+
+A ready-to-deploy Docker setup for the [zsazsa](https://github.com/zsazsa-project/zsazsa) CTI program management platform, together with the two components it builds on:
+
+| Component | What it does | Upstream |
+|---|---|---|
+| **MISP** | Threat intelligence platform; zsazsa's data store and identity provider | [MISP/misp-docker](https://github.com/MISP/misp-docker) |
+| **misp-scraper** | Turns RSS feeds and article URLs into MISP events | [cudeso/misp-scraper](https://github.com/cudeso/misp-scraper) |
+| **zsazsa** | CTI program management: stakeholders, PIRs/GIRs, products, briefings, collection | [zsazsa-project/zsazsa](https://github.com/zsazsa-project/zsazsa) |
+
+The three folders `misp-docker/`, `misp-scraper/` and `zsazsa/` are unmodified copies of their upstream repositories (see [UPSTREAM.md](UPSTREAM.md)). Everything specific to this deployment lives in `deploy/` and `scripts/`, and every site-specific value (hostname, addresses, e-mail, passwords) lives in files that git ignores.
+
+## Contents
+
+- [Architecture](#architecture)
+- [Repository layout](#repository-layout)
+- [Requirements](#requirements)
+- [What you must configure](#what-you-must-configure)
+- [Installation](#installation)
+- [Reverse proxy](#reverse-proxy)
+- [First run](#first-run)
+- [Day-to-day operations](#day-to-day-operations)
+- [Updating](#updating)
+- [Backup and restore](#backup-and-restore)
+- [Troubleshooting](#troubleshooting)
+- [Security notes and recommendations](#security-notes-and-recommendations)
+- [Credits and licenses](#credits-and-licenses)
+
+## Architecture
+
+```
+                 Browser
+                    │  https://misp.example.com            (and /zsazsa/)
+                    ▼
+        Reverse proxy (TLS, e.g. Nginx Proxy Manager)
+                    │  https://MISP_LAN_IP:MISP_HTTPS_PORT  (self-signed)
+════════════════════╪════════════ LAN ═══════════════════════════════════
+ Docker host        │
+   ipvlan/macvlan   ▼
+   network     ┌────────────┐
+   "cti-lan"   │ misp-nginx │  /          → misp-core (PHP-FPM)
+               │            │  /zsazsa/   → zsazsa webapp
+               └─────┬──────┘
+   bridge network    │  "misp-docker_default"
+   ┌─────────────────┴──────────────────────────────────────────────┐
+   │ misp-core   misp-modules   db (MariaDB)   redis (Valkey)   mail │
+   │ zsazsa: webapp  analyser  imap-collector                       │
+   │ misp-scraper: scraper-subscribe  scraper-cron                  │
+   └────────────────────────────────────────────────────────────────┘
+```
+
+- **No ports are published on the Docker host.** `misp-nginx` gets an address of its own on the LAN through an `ipvlan` (or `macvlan`) Docker network, so it never conflicts with ports 80/443 or anything else running on the host. It is the only container reachable from the LAN.
+- **zsazsa is served under MISP's own hostname**, at `https://<MISP_HOSTNAME>/zsazsa/`. `misp-nginx` proxies that path to the zsazsa container. This is required for zsazsa's single sign-on: zsazsa identifies the analyst from MISP's session cookie, which the browser only sends to MISP's hostname.
+- **One Redis** (MISP's) is shared: zsazsa reads MISP's PHP sessions from it (single sign-on), sends article URLs to misp-scraper through it, and keeps its background-job state in it.
+- zsazsa calls the MISP API on MISP's public URL, through the reverse proxy (needed for the single sign-on login redirect). misp-scraper talks to `misp-nginx` directly on the internal network.
+- All containers restart automatically after a reboot of the Docker host (`restart: always` / `unless-stopped`).
+
+## Repository layout
+
+| Path | Purpose | In git |
+|---|---|---|
+| `deploy/settings.env.example` | Template of the site settings | yes |
+| `deploy/settings.env` | **Your** site settings | no |
+| `deploy/misp-docker.override.yml` | Compose override for misp-docker: no host ports, LAN address, configurable ports, zsazsa route | yes |
+| `deploy/zsazsa.override.yml` | Compose override for zsazsa: no host ports, MISP reached through the proxy, restart policy | yes |
+| `deploy/nginx/05-zsazsa.sh` | Adds the `/zsazsa/` location to misp-nginx on every start | yes |
+| `deploy/reverse-proxy.example.conf` | Example configuration for a plain nginx reverse proxy | yes |
+| `scripts/init.sh` | Generates all configuration, passwords, keys and the certificate from `deploy/settings.env` | yes |
+| `scripts/update-upstream.sh` | Refreshes the three upstream folders | yes |
+| `misp-docker/.env`, `misp-docker/ssl/` | Generated MISP configuration, passwords and certificate | no |
+| `misp-docker/{configs,files,gnupg,logs}/` | MISP runtime data (created by the containers) | no |
+| `zsazsa/docker/.env` | Generated zsazsa compose settings | no |
+| `zsazsa/docker/volumes/` | zsazsa configuration (API keys), data, prompts and misp-scraper configuration | no |
+
+## Requirements
+
+- A Linux Docker host with **Docker Engine** and the **Compose plugin 2.24 or later** (`docker compose version`), plus `git` and `openssl`. A Docker host in a Proxmox LXC container works (use the `ipvlan` driver, see below).
+- A **free address on the LAN** for `misp-nginx`, outside the DHCP pool of your router.
+- A **reverse proxy** that terminates TLS for MISP's hostname, with a DNS record for that hostname pointing at it. The reverse proxy must run on **another machine than the Docker host** (see [Troubleshooting](#the-docker-host-cannot-reach-misp_lan_ip)).
+- At least **4 GB RAM** and 20 GB of disk for a small installation.
+- Outbound internet access for the containers (image pulls, feeds, scraped sites, optionally the OpenAI API).
+
+## What you must configure
+
+### Before installation: `deploy/settings.env`
+
+Copy `deploy/settings.env.example` to `deploy/settings.env` and set:
+
+| Setting | Meaning | Example |
+|---|---|---|
+| `MISP_HOSTNAME` | Public hostname of MISP; zsazsa is served at `https://<MISP_HOSTNAME>/zsazsa/` | `misp.example.com` |
+| `ADMIN_EMAIL` | E-mail (login) of the MISP administrator created on first start | `admin@example.com` |
+| `ADMIN_ORG` | Name of your organisation in MISP | `Example Org` |
+| `TZ` | Timezone of the containers | `Europe/Amsterdam` |
+| `MISP_LAN_IP` | LAN address of `misp-nginx`; the reverse proxy forwards to it | `192.168.1.19` |
+| `MISP_HTTPS_PORT` | HTTPS port of `misp-nginx` on that address (> 1024) | `8443` |
+| `MISP_HTTP_PORT` | HTTP port of `misp-nginx` (only redirects to HTTPS; > 1024) | `8080` |
+| `LAN_NETWORK_NAME` | Name of the Docker network on the LAN | `cti-lan` |
+| `LAN_DRIVER` | `ipvlan` (shares the host's MAC address; required in Proxmox LXC or behind MAC filtering) or `macvlan` | `ipvlan` |
+| `LAN_PARENT` | LAN interface of the Docker host (`ip -br addr`) | `eth0` |
+| `LAN_SUBNET` / `LAN_GATEWAY` | Your LAN and its router | `192.168.1.0/24` / `192.168.1.1` |
+| `LAN_IP_RANGE` | Addresses Docker may use on the LAN; must contain `MISP_LAN_IP` and lie outside the DHCP pool | `192.168.1.16/29` |
+| `PROXY_IP` | Address of the reverse proxy. MISP trusts its `X-Forwarded-For` header; the zsazsa containers reach `MISP_HOSTNAME` through it | `192.168.1.105` |
+| `PROXY_CERT_VALID` | `true` when the reverse proxy has a publicly trusted certificate (e.g. Let's Encrypt), `false` for self-signed/private CA | `true` |
+
+Use one `KEY=value` per line, no inline comments. Quotes are optional, also for values with spaces.
+
+`scripts/init.sh` generates everything else: all passwords and keys (MariaDB, Redis, MISP admin password and API key, encryption key, GPG passphrase, supervisor, zsazsa and misp-scraper secrets), a self-signed certificate for `misp-nginx`, and the zsazsa and misp-scraper configuration.
+
+### After the first start (in the web interfaces)
+
+| Where | What |
+|---|---|
+| MISP | Change the administrator password, enable two-factor authentication, enable the taxonomies zsazsa and misp-scraper use |
+| MISP | Create dedicated users and API keys for zsazsa and misp-scraper (they start with the admin key) |
+| MISP, optional | Outgoing mail: set `SMARTHOST_*` in `misp-docker/.env` |
+| zsazsa | Setup wizard: organisation, collection sources, AI provider (OpenAI API key or a local OpenAI-compatible LLM), focus points, notifications |
+| zsazsa | Single sign-on: save the SSO settings once and run "Test single sign-on" |
+| misp-scraper, optional | The RSS feeds to scrape: `zsazsa/docker/volumes/scraper-config/feedlist.json` |
+
+## Installation
+
+All commands run on the Docker host, as root (or a user in the `docker` group with sudo for the `chown` steps). The examples install into `/opt/misp-zsazsa`.
+
+### 1. Prepare the network
+
+- Exclude `MISP_LAN_IP` (and preferably all of `LAN_IP_RANGE`) from the DHCP pool of your router.
+- Create a DNS record for `MISP_HOSTNAME` pointing at your reverse proxy.
+- `macvlan` only: if the Docker host is a VM or container on Proxmox with the firewall enabled on its network device, disable MAC filtering there (or simply use `ipvlan`).
+
+### 2. Get the code and your settings
+
+```bash
+git clone <your-repository-url> /opt/misp-zsazsa
+cd /opt/misp-zsazsa
+cp deploy/settings.env.example deploy/settings.env
+nano deploy/settings.env
+```
+
+### 3. Generate the configuration
+
+```bash
+bash scripts/init.sh
+```
+
+This writes `misp-docker/.env`, `misp-docker/ssl/`, `zsazsa/docker/.env`, `zsazsa/docker/volumes/`, and creates the LAN network. Check the network:
+
+```bash
+docker network inspect cti-lan -f '{{.Driver}} {{.Options}} {{json .IPAM.Config}}'
+```
+
+Running `init.sh` again is safe: it re-applies `settings.env` to the `.env` files but never replaces existing passwords, keys, the certificate or the zsazsa/misp-scraper configuration.
+
+### 4. Start MISP
+
+```bash
+cd /opt/misp-zsazsa/misp-docker
+docker compose pull
+docker compose up -d
+docker compose ps                  # wait until misp-core and misp-nginx are "healthy"
+docker compose logs -f misp-core   # the first start initialises the database and takes a few minutes
+```
+
+The administrator credentials are in `misp-docker/.env`:
+
+```bash
+grep -E '^ADMIN_(EMAIL|PASSWORD)=' /opt/misp-zsazsa/misp-docker/.env
+```
+
+From another machine on the LAN (not from the Docker host itself), `curl -kI https://<MISP_LAN_IP>:<MISP_HTTPS_PORT>/users/login` should answer `200` (or a redirect).
+
+### 5. Configure the reverse proxy
+
+See [Reverse proxy](#reverse-proxy), then open `https://<MISP_HOSTNAME>` and log in.
+
+### 6. Start zsazsa and misp-scraper
+
+```bash
+cd /opt/misp-zsazsa/zsazsa/docker
+docker compose build
+docker compose up -d
+docker compose ps
+docker compose logs -f webapp scraper-subscribe
+```
+
+This starts five containers: `webapp`, `analyser` (hourly), `imap-collector` (every 15 minutes), `scraper-subscribe` (URLs pushed by zsazsa) and `scraper-cron` (RSS feeds, hourly). The intervals are in `zsazsa/docker/.env`.
+
+### 7. Finish the setup in the browser
+
+See [First run](#first-run).
+
+## Reverse proxy
+
+Forward `https://<MISP_HOSTNAME>` to **`https://<MISP_LAN_IP>:<MISP_HTTPS_PORT>`**. The scheme must be `https` (the HTTP port only redirects back to the public URL) and the backend certificate is self-signed, so certificate verification towards the backend must be off. zsazsa needs no rule of its own.
+
+**Nginx Proxy Manager** — add a Proxy Host:
+
+| Tab | Setting |
+|---|---|
+| Details | Domain names: `MISP_HOSTNAME`; Scheme: `https`; Forward hostname/IP: `MISP_LAN_IP`; Forward port: `MISP_HTTPS_PORT`; Block common exploits: on |
+| SSL | Your certificate; Force SSL, HTTP/2 and HSTS: on |
+| Advanced | `client_max_body_size 50M;`<br>`proxy_read_timeout 300s;`<br>`proxy_send_timeout 300s;` |
+
+NPM does not verify backend certificates, and it passes the `Host` and `X-Forwarded-*` headers MISP needs.
+
+**Plain nginx** — see [`deploy/reverse-proxy.example.conf`](deploy/reverse-proxy.example.conf).
+
+If you restrict access with an access list on the reverse proxy, allow the Docker host's own address too: the zsazsa containers call MISP's API through the proxy.
+
+## First run
+
+1. **MISP** — log in at `https://<MISP_HOSTNAME>` with `ADMIN_EMAIL` / `ADMIN_PASSWORD`, change the password, and enable two-factor authentication (*My Profile*).
+2. **Taxonomies** — under *Event Actions → List Taxonomies*, enable at least `tlp`, `workflow` and `admiralty-scale`.
+3. **zsazsa** — open `https://<MISP_HOSTNAME>/zsazsa/`. As a MISP site admin you get zsazsa's setup wizard (also at `/zsazsa/config/setup`): organisation, collection sources, AI, focus points and notifications. AI features need an OpenAI API key or a local OpenAI-compatible endpoint (e.g. Ollama).
+4. **Single sign-on** — in zsazsa, *Settings → System → Single sign-on*: save once (zsazsa then detects MISP's cookie name) and press **Test single sign-on**. Redis host, password and database are already filled in by `init.sh`.
+5. **Dedicated API keys (recommended)** — zsazsa and misp-scraper start with the MISP admin key. In MISP, create a user for each (*Administration → Add User*, your organisation, a role that can add and modify events, tag them and create tags, such as *Org Admin*, plus publishing for zsazsa), create an auth key for each, and put them in:
+   - `zsazsa/docker/volumes/config/__init__.py`: `MISP_KEY` and `MISP_WEBAPP_KEY` (or via zsazsa's Settings page)
+   - `zsazsa/docker/volumes/scraper-config/scraper.py`: `misp_key`
+
+   Then restart: `cd zsazsa/docker && docker compose restart`.
+6. **Feeds** — edit `zsazsa/docker/volumes/scraper-config/feedlist.json` and restart `scraper-cron`, or trigger a run now (see below).
+
+## Day-to-day operations
+
+Run MISP commands from `misp-docker/` and zsazsa/misp-scraper commands from `zsazsa/docker/`: Compose reads the `.env` file (and with it the overrides) from the current directory.
+
+```bash
+# Status
+cd /opt/misp-zsazsa/misp-docker   && docker compose ps
+cd /opt/misp-zsazsa/zsazsa/docker && docker compose ps
+
+# Restart after changing configuration
+docker compose restart                       # all services of that stack
+docker compose up -d                         # after changing .env or settings.env (recreates containers)
+
+# Stop / start (data is kept)
+docker compose down
+docker compose up -d
+
+# zsazsa / misp-scraper: run now instead of waiting for the interval
+docker compose exec webapp python run_analyser.py
+docker compose exec webapp python run_imap_collector.py
+docker compose run --rm scraper-cron cron
+
+# MISP command line (cake)
+cd /opt/misp-zsazsa/misp-docker
+docker compose exec misp-core sudo -u www-data /var/www/MISP/app/Console/cake Admin getSetting MISP.baseurl
+docker compose exec misp-core sudo -u www-data /var/www/MISP/app/Console/cake user change_pw <email> '<new password>'
+```
+
+After changing `deploy/settings.env`, run `bash scripts/init.sh` and then `docker compose up -d` in both stacks. Settings that live in the zsazsa or misp-scraper configuration (MISP URL, API keys, Redis) are not rewritten by `init.sh`: change them in `zsazsa/docker/volumes/` or on zsazsa's Settings page.
+
+The stacks show up in Portainer as stacks created outside Portainer ("limited" control): manage them with the commands above.
+
+## Updating
+
+```bash
+cd /opt/misp-zsazsa
+bash scripts/update-upstream.sh    # refreshes misp-docker/, misp-scraper/, zsazsa/ and UPSTREAM.md
+git diff --stat                    # review upstream changes
+bash scripts/init.sh               # applies the new MISP image tags to misp-docker/.env
+
+cd misp-docker      && docker compose pull && docker compose up -d
+cd ../zsazsa/docker && docker compose build --pull && docker compose up -d
+```
+
+Then open zsazsa's *Settings → System* and run any migration listed there that you have not run before. Commit the result to your repository. Read the upstream release notes before updating MISP across minor versions.
+
+The MISP images are pinned to the version in `misp-docker/template.env` (`CORE_RUNNING_TAG`, `MODULES_RUNNING_TAG`), so a `docker compose pull` alone never upgrades MISP unexpectedly. Avoid automatic updaters such as Watchtower for MISP.
+
+## Backup and restore
+
+What to back up:
+
+| Data | Where |
+|---|---|
+| MISP database | Docker volume `misp-docker_mysql_data` (dump it, see below) |
+| MISP files, configuration, GPG keys, certificate, secrets | `misp-docker/{files,configs,gnupg,ssl}/`, `misp-docker/.env` |
+| zsazsa and misp-scraper configuration and data | `zsazsa/docker/volumes/`, `zsazsa/docker/.env` |
+| Site settings | `deploy/settings.env` |
+
+```bash
+BACKUP=/var/backups/misp-zsazsa/$(date +%F); mkdir -p "$BACKUP"
+cd /opt/misp-zsazsa/misp-docker
+docker compose exec -T db sh -c 'exec mariadb-dump --single-transaction -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"' | gzip > "$BACKUP/misp-db.sql.gz"
+tar czf "$BACKUP/files.tgz" -C /opt/misp-zsazsa \
+    misp-docker/.env misp-docker/files misp-docker/configs misp-docker/gnupg misp-docker/ssl \
+    zsazsa/docker/.env zsazsa/docker/volumes deploy/settings.env
+```
+
+Restore on a fresh checkout: extract `files.tgz` into `/opt/misp-zsazsa`, run `bash scripts/init.sh` (it keeps the restored secrets), start only the database (`docker compose up -d db`), load the dump (`gunzip -c misp-db.sql.gz | docker compose exec -T db sh -c 'exec mariadb -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"'`), then start everything as in the installation.
+
+The backup contains all passwords and API keys: store it encrypted.
+
+## Troubleshooting
+
+### Where the logs are
+
+| Component | Command or file |
+|---|---|
+| MISP start-up, initialisation, workers | `docker compose logs -f misp-core` (in `misp-docker/`) |
+| MISP application errors | `misp-docker/logs/error.log`, `debug.log`, `exec-errors.log`; also *Administration → Server Settings → Diagnostics* and *Audit → Logs* in the web interface |
+| Web server (incl. `/zsazsa/` proxy) | `docker compose logs -f misp-nginx` |
+| Database / Redis / modules / mail | `docker compose logs db`, `redis`, `misp-modules`, `mail` |
+| zsazsa web app | `docker compose logs -f webapp` (in `zsazsa/docker/`) |
+| zsazsa's own log (pipeline, SSO decisions, MISP calls) | `zsazsa/docker/volumes/data/analyser.log` |
+| zsazsa analyser / IMAP collector | `docker compose logs analyser`, `imap-collector` |
+| misp-scraper | `docker compose logs scraper-subscribe scraper-cron` and `zsazsa/docker/volumes/scraper-config/scraper.log` (raise `logging_level` in `scraper.py` to `info` or `debug` for more) |
+| Container health | `docker inspect -f '{{json .State.Health}}' misp-docker-misp-core-1` |
+| Restarts, crashes, OOM kills | `docker events --since 1h`, `docker inspect -f '{{.RestartCount}} {{.State.OOMKilled}}' <container>` |
+
+Useful checks:
+
+```bash
+# The effective compose configuration (overrides applied)
+docker compose config
+
+# nginx configuration inside misp-nginx, including the /zsazsa/ locations
+cd misp-docker && docker compose exec misp-nginx nginx -T | grep -A12 'zsazsa CTI'
+
+# Redis reachable with the configured password
+docker compose exec redis sh -c 'valkey-cli -a "$REDIS_PASSWORD" --no-auth-warning ping'
+
+# zsazsa reaches MISP through the reverse proxy
+cd zsazsa/docker && docker compose exec webapp python -c "import config, urllib.request; print(urllib.request.urlopen(config.MISP_WEBAPP_URL + '/users/login').status)"
+```
+
+### misp-nginx does not start
+
+- *`network cti-lan not found`* — the LAN network does not exist on this host: run `bash scripts/init.sh` on the Docker host.
+- *`Address already in use`* — `MISP_LAN_IP` is taken by another device or container. Pick a free address inside `LAN_IP_RANGE`.
+- *`BASE_URL starts with https://, but SSL certificate is NOT present`* — `misp-docker/ssl/cert.pem` or `key.pem` is missing: run `init.sh`.
+- *`key.pem exists but is not readable by uid 101`* — `chgrp 101 misp-docker/ssl/key.pem && chmod 640 misp-docker/ssl/key.pem`.
+- *`failed to create the ipvlan/macvlan port`* or no traffic at all — wrong `LAN_PARENT`; with `macvlan` in Proxmox or on a VM, MAC filtering drops the traffic: use `LAN_DRIVER=ipvlan` (remove the network with `docker network rm cti-lan` while misp-nginx is down, then run `init.sh` again).
+
+### The Docker host cannot reach MISP_LAN_IP
+
+Expected: with `ipvlan` and `macvlan`, the host and its containers on the LAN network cannot talk to each other directly. Test from another machine. This is also why the reverse proxy must run elsewhere, and why the zsazsa containers reach MISP through the reverse proxy.
+
+### MISP through the reverse proxy
+
+- *502 Bad Gateway* — misp-nginx is not running or not healthy (`docker compose ps`), or the proxy forwards to the wrong address, port or scheme (must be `https://MISP_LAN_IP:MISP_HTTPS_PORT`).
+- *Too many redirects* — the proxy forwards to the HTTP port; use the HTTPS port.
+- *Login form says the request was black-holed / CSRF errors* — the browser URL differs from `BASE_URL` in `misp-docker/.env`, or the proxy does not pass the `Host` header.
+- *Uploads fail* — raise `client_max_body_size` on the proxy (and `NGINX_CLIENT_MAX_BODY_SIZE`/`PHP_UPLOAD_MAX_FILESIZE` in `misp-docker/.env`).
+- *The first start takes long / misp-core unhealthy* — the database is initialised on the first start; follow `docker compose logs -f misp-core`. MariaDB reserves `INNODB_BUFFER_POOL_SIZE` (2 GB by default): lower it in `misp-docker/.env` on small hosts.
+
+### zsazsa
+
+- *`/zsazsa/` returns 404* — the location is missing in misp-nginx. `docker compose logs misp-nginx | grep 05-zsazsa` shows whether the script ran; *"Ignoring ..., not executable"* means `chmod +x deploy/nginx/05-zsazsa.sh` (done by `init.sh`), then `docker compose up -d --force-recreate misp-nginx`.
+- *`/zsazsa/` returns 502/504* — the zsazsa web app is down or not on misp-docker's network: `docker compose ps` in `zsazsa/docker/`, `docker network inspect misp-docker_default`. Start MISP before zsazsa: zsazsa joins MISP's network.
+- *zsazsa does not recognise you / login loop* — use **Test single sign-on** on zsazsa's Settings page; zsazsa must be opened under `https://<MISP_HOSTNAME>/zsazsa/`. `WRONGPASS` in `analyser.log` means the `MISP_SESSION_REDIS_PASSWORD` in zsazsa's configuration differs from `REDIS_PASSWORD` in `misp-docker/.env`.
+- *`CERTIFICATE_VERIFY_FAILED`* — the reverse proxy's certificate is not publicly trusted: set `MISP_VERIFYCERT` and `MISP_WEBAPP_VERIFYCERT` to `False` in `zsazsa/docker/volumes/config/__init__.py` and restart.
+- *Connection refused/timeouts to MISP* — check `PROXY_IP` and `MISP_HOSTNAME` in `zsazsa/docker/.env` (they become an `/etc/hosts` entry in the containers) and any access list on the reverse proxy.
+- *Permission denied in `/app/config` or `/app/data`* — `chown -R 1000:1000 zsazsa/docker/volumes`.
+
+### misp-scraper
+
+- *`misp-scraper: not starting until the configuration is fixed`* — `misp_url` or `misp_key` is missing or `scraper.py` does not load. Fix `zsazsa/docker/volumes/scraper-config/scraper.py`; the container restarts on its own.
+- *Events do not appear in zsazsa* — zsazsa recognises scraper events by `SCRAPER_MARKER_TAG` (`zsazsa:source="misp-scraper"`), which must be in `misp_scraper_tags_local` in `scraper.py` (it is by default).
+- *URLs pushed from zsazsa are never scraped* — `scraper-subscribe` must be running; the Redis channel (`redis_channel` / `SCRAPER_REDIS_CHANNEL`, default `urls`) and password must match.
+
+## Security notes and recommendations
+
+- **Secrets stay out of git.** `.gitignore` excludes `deploy/settings.env`, all `.env` files, certificates and `zsazsa/docker/volumes/`. Check with `git status --ignored` before committing; a pre-commit secret scanner such as [gitleaks](https://github.com/gitleaks/gitleaks) adds a safety net.
+- **Only misp-nginx is on the LAN**, and only behind the reverse proxy is it meant to be used. Containers on an `ipvlan`/`macvlan` network bypass the Docker host's firewall: restrict access to `MISP_LAN_IP` to the reverse proxy on your router or VLAN.
+- **Replace the admin API key** in zsazsa and misp-scraper with dedicated, least-privilege users (see [First run](#first-run)).
+- **Enable two-factor authentication** in MISP, or connect it to your identity provider (OIDC/LDAP, see `misp-docker/README.md`).
+- **Distribution**: misp-scraper is configured to create events for your organisation only (`misp_distribution = 0`). Raise it deliberately if you sync with other MISP instances, and consider MISP-Guard (`COMPOSE_PROFILES=misp-guard`) when you do.
+- **Backups** of the database and volumes, stored encrypted (see [Backup and restore](#backup-and-restore)).
+- **Log rotation**: limit Docker's JSON logs host-wide in `/etc/docker/daemon.json` (`"log-opts": {"max-size": "10m", "max-file": "3"}`), and rotate `misp-docker/logs/` and the zsazsa/misp-scraper log files with logrotate.
+- **Mail**: configure the `SMARTHOST_*` settings in `misp-docker/.env` to have MISP send notifications and password resets.
+- **Resources**: tune `INNODB_BUFFER_POOL_SIZE` and the `PHP_*` settings in `misp-docker/.env` to the host's memory.
+
+## Credits and licenses
+
+The files of this repository outside the three upstream folders (`deploy/`, `scripts/`, this README and the other top-level files) are Copyright (C) 2026 Palmans IT Solutions and licensed under the **GNU Affero General Public License v3.0**, see [LICENSE](LICENSE).
+
+This setup is based on the *misp-zsazsa* example from the Kraven Security livestream "MISP from scratch": <https://github.com/kraven-security/livestreams/tree/main/misp-from-scratch/misp-zsazsa>.
+
+The bundled software belongs to its authors and keeps its own license:
+
+- [MISP/misp-docker](https://github.com/MISP/misp-docker) — GNU GPL v3 (`misp-docker/LICENSE`)
+- [cudeso/misp-scraper](https://github.com/cudeso/misp-scraper) — GNU AGPL v3 (`misp-scraper/LICENSE`)
+- [zsazsa-project/zsazsa](https://github.com/zsazsa-project/zsazsa) — GNU AGPL v3 (`zsazsa/LICENSE`); its Docker setup credits Chris Horsley and elhoim
+- [MISP](https://github.com/MISP/MISP) — GNU AGPL v3

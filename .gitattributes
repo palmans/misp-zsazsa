@@ -1,0 +1,11 @@
+# Shell scripts and configuration end up in Linux containers: keep LF line
+# endings, also in a checkout on Windows.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
