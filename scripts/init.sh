@@ -189,6 +189,7 @@ set_env "$ZSAZSA_ENV" REDIS_PORT 6379
 set_env "$ZSAZSA_ENV" REDIS_PASSWORD "$REDIS_PASSWORD"
 set_env "$ZSAZSA_ENV" MISP_HOSTNAME "$MISP_HOSTNAME"
 set_env "$ZSAZSA_ENV" PROXY_IP "$PROXY_IP"
+set_env "$ZSAZSA_ENV" TZ "$TZ"
 chmod 600 "$ZSAZSA_ENV"
 
 info "zsazsa/docker/volumes/config/__init__.py"

@@ -6,21 +6,31 @@ x-misp-via-proxy: &misp-via-proxy
   extra_hosts:
     - "${MISP_HOSTNAME:?Missing MISP_HOSTNAME in .env, run scripts/init.sh}:${PROXY_IP:?Missing PROXY_IP in .env, run scripts/init.sh}"
 
+x-timezone: &timezone
+  # Log times in local time. The slim Python images have no time zone data of
+  # their own, so the host's is used.
+  environment:
+    TZ: "${TZ:-UTC}"
+  volumes:
+    - "/usr/share/zoneinfo:/usr/share/zoneinfo:ro"
+
 services:
   webapp:
-    <<: *misp-via-proxy
+    <<: [*misp-via-proxy, *timezone]
     # Reached only by misp-nginx, as http://zsazsa:5000 on misp-docker's network.
     ports: !reset []
 
   analyser:
-    <<: *misp-via-proxy
+    <<: [*misp-via-proxy, *timezone]
 
   imap-collector:
-    <<: *misp-via-proxy
+    <<: [*misp-via-proxy, *timezone]
 
   # on-failure is not restarted when the Docker host reboots.
   scraper-subscribe:
+    <<: *timezone
     restart: unless-stopped
 
   scraper-cron:
+    <<: *timezone
     restart: unless-stopped

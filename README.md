@@ -371,7 +371,7 @@ Expected: with `ipvlan` and `macvlan`, the host and its containers on the LAN ne
 - **Distribution**: misp-scraper is configured to create events for your organisation only (`misp_distribution = 0`). Raise it deliberately if you sync with other MISP instances, and consider MISP-Guard (`COMPOSE_PROFILES=misp-guard`) when you do.
 - **Backups** of the database and volumes, stored encrypted (see [Backup and restore](#backup-and-restore)).
 - **Log rotation**: limit Docker's JSON logs host-wide in `/etc/docker/daemon.json` (`"log-opts": {"max-size": "10m", "max-file": "3"}`), and rotate `misp-docker/logs/` and the zsazsa/misp-scraper log files with logrotate.
-- **Mail**: configure the `SMARTHOST_*` settings in `misp-docker/.env` to have MISP send notifications and password resets.
+- **Mail**: configure the `SMARTHOST_*` settings in `misp-docker/.env` to have MISP send notifications and password resets. Set `SMARTHOST_PORT` explicitly (an empty value breaks the relay configuration), and with authentication also `SMARTHOST_ALIASES` (the relay's hostname or address, or `*`): without it the user and password are not used. The mail container (exim) only sends the password when the relay offers STARTTLS. Test it with `docker compose exec mail sh -c 'printf "Subject: MISP test\n\nTest\n" | exim -f <MISP.email> <your address>'` and check `docker compose exec mail tail /var/log/exim4/mainlog`.
 - **Resources**: tune `INNODB_BUFFER_POOL_SIZE` and the `PHP_*` settings in `misp-docker/.env` to the host's memory.
 
 ## Credits and licenses

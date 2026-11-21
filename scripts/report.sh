@@ -60,13 +60,21 @@ mask() {
     section "MISP settings"
     for s in MISP.baseurl MISP.external_baseurl MISP.live MISP.host_org_id MISP.email Security.rest_client_baseurl \
         Security.csp_enforce Security.require_password_confirmation Session.defaults Session.timeout \
-        Session.cookieTimeout Session.autoRegenerate SimpleBackgroundJobs.enabled Plugin.Enrichment_services_url; do
+        Session.cookieTimeout Session.autoRegenerate SimpleBackgroundJobs.enabled Plugin.Enrichment_services_url \
+        MISP.disable_emailing MISP.contact; do
         value="$(cake Admin getSetting "$s" | tr -d '\n' | grep -oE '"value": *("[^"]*"|[^,}]*)' | head -n 1)"
         printf '%s = %s\n' "$s" "${value#*: }"
     done
     # Sessions (single sign-on) belong in db0; MISP's jobs use db1, its cache db13.
     printf 'PHP sessions in Redis db0: %s\n' "$(MISP exec -T redis sh -c 'valkey-cli -a "$REDIS_PASSWORD" --no-auth-warning -n 0 --scan --pattern "PHPREDIS_SESSION:*" | wc -l' 2>&1)"
     MISP exec -T misp-core sh -c 'grep -hE "^session\.(save_handler|save_path|cookie_secure|cookie_samesite)" /etc/php/*/fpm/php.ini' 2>&1
+
+    section "MISP security audit"
+    cake Admin securityAudit | head -80
+
+    section "Mail (misp-docker mail container)"
+    MISP exec -T mail sh -c 'env | grep -E "^SMARTHOST_|^RELAY_"; echo "--- smarthost:"; grep -E "^dc_smarthost|^dc_eximconfig_configtype" /etc/exim4/update-exim4.conf.conf; echo "--- auth entries: $(grep -c . /etc/exim4/passwd.client 2> /dev/null || echo 0)"; echo "--- queue:"; exim -bp | head -20; echo "--- mainlog:"; tail -n 20 /var/log/exim4/mainlog 2> /dev/null' 2>&1
+    MISP logs --tail 20 mail 2>&1
 
     section "MISP workers (supervisor)"
     MISP exec -T misp-core supervisorctl -c /etc/supervisor/supervisord.conf status 2>&1 | head -40
