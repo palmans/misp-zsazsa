@@ -29,6 +29,10 @@ services:
       default:
       lan:
         ipv4_address: "${MISP_LAN_IP:?Missing MISP_LAN_IP in .env, run scripts/init.sh}"
+        # Default route through the LAN's gateway, so replies to clients outside
+        # the LAN subnet (VPN, other VLANs) leave from MISP_LAN_IP. Through the
+        # bridge they would leave NATed from the host's address, and be dropped.
+        gw_priority: 1
 
 networks:
   lan:

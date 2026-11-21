@@ -341,6 +341,10 @@ cd zsazsa/docker && docker compose exec webapp python -c "import config, urllib.
 
 Expected: with `ipvlan` and `macvlan`, the host and its containers on the LAN network cannot talk to each other directly. Test from another machine. This is also why the reverse proxy must run elsewhere, and why the zsazsa containers reach MISP through the reverse proxy.
 
+### MISP_LAN_IP works from the LAN, not from a VPN or another subnet
+
+misp-nginx sits on two networks. Its replies to clients outside the LAN subnet follow its default route; through misp-docker's bridge they would leave NATed from the Docker host's address and be dropped by the client. The override gives the LAN network `gw_priority: 1`, so the default route is the LAN gateway (needs Docker Engine 28 or later). Check it with `nsenter -t $(docker inspect -f '{{.State.Pid}}' misp-docker-misp-nginx-1) -n ip route`: the `default via` line must name `LAN_GATEWAY`. The router must also route the VPN's subnet to the LAN and allow it in its firewall.
+
 ### MISP through the reverse proxy
 
 - *502 Bad Gateway* — misp-nginx is not running or not healthy (`docker compose ps`), or the proxy forwards to the wrong address, port or scheme (must be `https://MISP_LAN_IP:MISP_HTTPS_PORT`).
