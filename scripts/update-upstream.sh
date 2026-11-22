@@ -76,5 +76,8 @@ Updated. Next:
   bash scripts/init.sh                # applies new image tags to misp-docker/.env
   cd misp-docker && docker compose pull && docker compose up -d
   cd ../zsazsa/docker && docker compose build --pull && docker compose up -d
-Then open zsazsa's Settings > System and run any new migration it lists.
+Then read the "Upgrading" notes in zsazsa/CHANGELOG.md, take changed prompts with
+  bash scripts/sync-prompts.sh [--apply <prompt.md> ...]
+and run any new migration zsazsa lists under Settings > System.
+Commit the result, so the repository matches what runs.
 EOF

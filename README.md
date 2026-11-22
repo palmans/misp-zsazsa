@@ -283,7 +283,14 @@ cd misp-docker      && docker compose pull && docker compose up -d
 cd ../zsazsa/docker && docker compose build --pull && docker compose up -d
 ```
 
-Then open zsazsa's *Settings → System* and run any migration listed there that you have not run before. Commit the result to your repository. Read the upstream release notes before updating MISP across minor versions.
+Then:
+
+- **Read the "Upgrading" notes** at the top of `zsazsa/CHANGELOG.md`. They say what an update needs beyond a rebuild.
+- **Prompts.** zsazsa keeps its AI prompts in `zsazsa/docker/volumes/prompts`, so edits on its Prompts tab survive an update, and a prompt the update changes is not taken over by itself. `bash scripts/sync-prompts.sh` lists the prompts that differ from the shipped ones; `bash scripts/sync-prompts.sh --apply <prompt.md> ...` takes the ones the CHANGELOG names (without names: all of them, also those you edited). Old copies go to `zsazsa/docker/volumes/data/prompts-backup/`.
+- **Migrations.** zsazsa's *Settings → System → Migration* lists one-off scripts for data stored by older releases. Each has a dry run; run the ones whose dry run reports changes. On an installation that started with a recent release they usually find nothing.
+- **Commit** the updated folders, so the repository matches what runs. Running `update-upstream.sh` on another checkout (your workstation) and pulling on the Docker host works as well; then run only the `init.sh` and `docker compose` steps on the host.
+
+Read the upstream release notes before updating MISP across minor versions.
 
 The MISP images are pinned to the version in `misp-docker/template.env` (`CORE_RUNNING_TAG`, `MODULES_RUNNING_TAG`), so a `docker compose pull` alone never upgrades MISP unexpectedly. Avoid automatic updaters such as Watchtower for MISP.
 
@@ -384,7 +391,7 @@ misp-nginx sits on two networks. Its replies to clients outside the LAN subnet f
 - *502 Bad Gateway* — misp-nginx is not running or not healthy (`docker compose ps`), or the proxy forwards to the wrong address, port or scheme (must be `https://MISP_LAN_IP:MISP_HTTPS_PORT`). A 502 page from nginx itself (not from the proxy) means misp-core is still starting, or misp-nginx still uses misp-core's previous address after misp-core was recreated: `docker compose restart misp-nginx`. The override restarts misp-nginx along with misp-core when Compose recreates it.
 - *Too many redirects* — the proxy forwards to the HTTP port; use the HTTPS port.
 - *Login form says the request was black-holed / CSRF errors* — the browser URL differs from `BASE_URL` in `misp-docker/.env`, or the proxy does not pass the `Host` header.
-- *Uploads fail* — raise `client_max_body_size` on the proxy (and `NGINX_CLIENT_MAX_BODY_SIZE`/`PHP_UPLOAD_MAX_FILESIZE` in `misp-docker/.env`).
+- *Uploads fail* — raise `client_max_body_size` on the proxy (and `NGINX_CLIENT_MAX_BODY_SIZE`/`PHP_UPLOAD_MAX_FILESIZE`/`PHP_POST_MAX_SIZE` in `misp-docker/.env`). All are 50 MB here. zsazsa's threat report import (`REPORT_IMPORT_MAX_MB`, 30 MB) stores the PDF in MISP base64-encoded, a third larger: raise these limits with it.
 - *The first start takes long / misp-core unhealthy* — the database is initialised on the first start; follow `docker compose logs -f misp-core` until *MISP is now live*, then run `docker compose up -d` again if misp-nginx was left in the *Created* state. The override gives misp-core 15 minutes before a failed health check counts. MariaDB reserves `INNODB_BUFFER_POOL_SIZE` (2 GB by default): lower it in `misp-docker/.env` on small hosts.
 
 ### zsazsa

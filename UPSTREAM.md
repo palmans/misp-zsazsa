@@ -8,5 +8,5 @@ update: deployment-specific changes belong in `deploy/`.
 |---|---|---|---|
 | `misp-docker/` | https://github.com/MISP/misp-docker | `88e90bf1896e` | 2026-11-19 |
 | `misp-scraper/` | https://github.com/cudeso/misp-scraper | `0405808fb5dd` | 2026-11-18 |
-| `zsazsa/` | https://github.com/zsazsa-project/zsazsa | `4cb881f35c77` | 2026-11-20 |
+| `zsazsa/` | https://github.com/zsazsa-project/zsazsa | `10be1242861a` | 2026-11-22 |
 
