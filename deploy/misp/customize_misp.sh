@@ -10,6 +10,14 @@ CAKE="sudo -u www-data /var/www/MISP/app/Console/cake"
 # connection insecure (security audit), and does not mark session cookies Secure.
 $CAKE Admin setSetting -q Security.force_https true
 
+# Sign outgoing mail with MISP's own GPG key (security audit). misp-docker
+# generates the key on the first start.
+$CAKE Admin setSetting -q GnuPG.sign true
+
+# New events: your organisation only, as zsazsa and misp-scraper use. misp-docker
+# defaults to "this community". Change it here; a change in the UI is undone on restart.
+$CAKE Admin setSetting -q MISP.default_event_distribution 0
+
 # PHP session hardening from MISP's security audit. The container is recreated
 # from the image on updates, so php.ini is edited on every start.
 set_php() {
@@ -26,4 +34,4 @@ for ini in /etc/php/*/fpm/php.ini /etc/php/*/cli/php.ini; do
     set_php "$ini" session.sid_bits_per_character 5
 done
 
-echo "customize_misp.sh | force_https and PHP session hardening applied"
+echo "customize_misp.sh | force_https, mail signing, default distribution and PHP session hardening applied"
