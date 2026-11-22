@@ -125,8 +125,14 @@ def hide_other_tags(taxonomy_id, namespace, keep):
     """Hides the tags of the taxonomy that exist but are not in keep."""
     view = call(f"/taxonomies/view/{taxonomy_id}", fatal=False)
     entries = view.get("entries", []) if isinstance(view, dict) else []
+    def hidden(entry):
+        tag = entry.get("existing_tag")
+        tag = tag.get("Tag", tag) if isinstance(tag, dict) else {}
+        return tag.get("hide_tag") in (True, 1, "1")
+
     others = [e["tag"] for e in entries
-              if isinstance(e, dict) and e.get("existing_tag") and e.get("tag") not in keep]
+              if isinstance(e, dict) and e.get("existing_tag") and e.get("tag") not in keep
+              and not hidden(e)]
     if not others:
         return
     call("/taxonomies/hideTag", {"Tag": {"taxonomy_id": taxonomy_id, "nameList": json.dumps(others)}},

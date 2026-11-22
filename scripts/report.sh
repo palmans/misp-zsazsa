@@ -102,13 +102,14 @@ mask() {
     section "zsazsa reaches MISP through the reverse proxy"
     ZSAZSA exec -T webapp python -c "import config, urllib.request; r = urllib.request.urlopen(config.MISP_WEBAPP_URL + '/users/login', timeout=10); print(config.MISP_WEBAPP_URL, r.status)" 2>&1 | tail -3
 
-    section "zsazsa and misp-scraper logs (last lines)"
+    # The last 2 hours only, without zsazsa's PyMISP version warning on every call.
+    section "zsazsa and misp-scraper logs (last 2 hours)"
     for s in webapp analyser imap-collector scraper-subscribe scraper-cron; do
         printf -- '--- %s\n' "$s"
-        ZSAZSA logs --tail 15 "$s" 2>&1
+        ZSAZSA logs --since 2h "$s" 2>&1 | grep -v "PyMISP recommended" | tail -n 20
     done
     printf -- '--- zsazsa/docker/volumes/data/analyser.log\n'
-    tail -n 40 "$ROOT/zsazsa/docker/volumes/data/analyser.log" 2>&1
+    grep -v "PyMISP recommended" "$ROOT/zsazsa/docker/volumes/data/analyser.log" 2>&1 | tail -n 40
     printf -- '--- zsazsa/docker/volumes/scraper-config/scraper.log\n'
     tail -n 40 "$ROOT/zsazsa/docker/volumes/scraper-config/scraper.log" 2>&1
     grep -E '^(misp_url|misp_verifycert|misp_distribution|rawhtml_distribution|logging_level|misp_scraper_tags_local|redis_channel)' \
