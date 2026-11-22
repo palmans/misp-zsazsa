@@ -379,7 +379,7 @@ misp-nginx sits on two networks. Its replies to clients outside the LAN subnet f
 
 ### MISP through the reverse proxy
 
-- *502 Bad Gateway* — misp-nginx is not running or not healthy (`docker compose ps`), or the proxy forwards to the wrong address, port or scheme (must be `https://MISP_LAN_IP:MISP_HTTPS_PORT`).
+- *502 Bad Gateway* — misp-nginx is not running or not healthy (`docker compose ps`), or the proxy forwards to the wrong address, port or scheme (must be `https://MISP_LAN_IP:MISP_HTTPS_PORT`). A 502 page from nginx itself (not from the proxy) means misp-core is still starting, or misp-nginx still uses misp-core's previous address after misp-core was recreated: `docker compose restart misp-nginx`. The override restarts misp-nginx along with misp-core when Compose recreates it.
 - *Too many redirects* — the proxy forwards to the HTTP port; use the HTTPS port.
 - *Login form says the request was black-holed / CSRF errors* — the browser URL differs from `BASE_URL` in `misp-docker/.env`, or the proxy does not pass the `Host` header.
 - *Uploads fail* — raise `client_max_body_size` on the proxy (and `NGINX_CLIENT_MAX_BODY_SIZE`/`PHP_UPLOAD_MAX_FILESIZE` in `misp-docker/.env`).

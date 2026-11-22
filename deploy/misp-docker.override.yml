@@ -17,6 +17,12 @@ services:
       - "./exim-macros:/etc/exim4/_docker_additional_macros:ro"
 
   misp-nginx:
+    # nginx resolves misp-core once, at its start: restart it whenever Compose
+    # restarts or recreates misp-core, which may come back on another address.
+    depends_on:
+      misp-core:
+        condition: service_healthy
+        restart: true
     # No ports on the Docker host: nginx has an address of its own on the LAN.
     ports: !reset []
     environment:

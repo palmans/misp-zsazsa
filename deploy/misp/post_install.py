@@ -17,10 +17,12 @@ Prints "KEY <name> <authkey>" for every key it creates.
 
 import json
 import os
+import re
 import secrets
 import ssl
 import string
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -42,7 +44,9 @@ def call(path, data=None, fatal=True):
         with urllib.request.urlopen(request, context=CONTEXT, timeout=300) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
-        message = f"{request.method} {path}: HTTP {error.code} {error.read()[:500].decode(errors='replace')}"
+        detail = error.read()[:2000].decode(errors="replace")
+        title = re.search(r"<title>(.*?)</title>", detail, re.S)
+        message = f"{request.method} {path}: HTTP {error.code} {title.group(1).strip() if title else detail[:500]}"
         if fatal:
             sys.exit(message)
         print(f"warning: {message}")
@@ -51,6 +55,23 @@ def call(path, data=None, fatal=True):
         return json.loads(body) if body else None
     except ValueError:
         return body.decode(errors="replace")
+
+
+def wait_for_misp(seconds=300):
+    """misp-core answers only once its start is done; nginx says 502 until then."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            request = urllib.request.Request(URL + "/servers/getVersion",
+                                             headers={"Authorization": ADMIN_KEY, "Accept": "application/json"})
+            with urllib.request.urlopen(request, context=CONTEXT, timeout=30):
+                return
+        except (urllib.error.URLError, OSError) as error:
+            if time.monotonic() > deadline:
+                sys.exit(f"MISP did not answer within {seconds}s ({error}). Is misp-core healthy? "
+                         "If so, restart misp-nginx: docker compose restart misp-nginx")
+            print(f"waiting for MISP ({error})", flush=True)
+            time.sleep(10)
 
 
 def unwrap(item, model):
@@ -142,6 +163,7 @@ def users(specs, role_name, new_keys):
         print(f"KEY {name} {authkey['authkey_raw']}")
 
 
+wait_for_misp()
 taxonomies(os.environ.get("TAXONOMIES", "").split())
 users(os.environ.get("USERS", "").split(), os.environ.get("ROLE", "Org Admin"),
       os.environ.get("NEW_KEYS") == "1")
