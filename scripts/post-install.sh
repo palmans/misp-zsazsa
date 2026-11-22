@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Run once on the Docker host, after MISP's first start:
 #   - enables the taxonomies zsazsa and misp-scraper tag with
-#   - creates a MISP user with its own API key for zsazsa and for misp-scraper
-#     (role Org Admin), each key only valid from the address that tool calls from
+#   - creates a MISP user with its own API key for zsazsa (role "zsazsa", created
+#     here) and for misp-scraper (role Org Admin), each key only valid from the
+#     address that tool calls from
 #   - puts those keys in their configuration in place of the administrator's
 #     key, and restarts them
 # Safe to run again: existing users are left alone, unless --new-keys.
@@ -46,19 +47,29 @@ fi
 # Plus addresses: unique in MISP, delivered to the administrator's mailbox.
 LOCAL="${ADMIN_EMAIL%@*}"
 DOMAIN="${ADMIN_EMAIL#*@}"
-USERS="zsazsa=$LOCAL+zsazsa@$DOMAIN=$ZSAZSA_FROM scraper=$LOCAL+scraper@$DOMAIN=$SCRAPER_FROM"
+# zsazsa gets a role of its own (see CUSTOM_ROLES in deploy/misp/post_install.py),
+# misp-scraper Org Admin.
+USERS="zsazsa=$LOCAL+zsazsa@$DOMAIN=$ZSAZSA_FROM=zsazsa scraper=$LOCAL+scraper@$DOMAIN=$SCRAPER_FROM"
 
 info "MISP: taxonomies, users and API keys"
 OUTPUT="$(cd "$MISP_DIR" && docker compose exec -T \
     -e MISP_URL="https://misp-nginx:${HTTPS_PORT:-8443}" \
     -e TAXONOMIES="$TAXONOMIES" -e USERS="$USERS" -e ROLE="Org Admin" -e NEW_KEYS="$NEW_KEYS" \
     misp-core python3 - < "$ROOT/deploy/misp/post_install.py")"
-grep -v '^KEY ' <<< "$OUTPUT" | sed 's/^/    /'
+grep -vE '^(KEY|COOKIE) ' <<< "$OUTPUT" | sed 's/^/    /'
 
 ZSAZSA_KEY="$(awk '$1 == "KEY" && $2 == "zsazsa" { print $3 }' <<< "$OUTPUT")"
 SCRAPER_KEY="$(awk '$1 == "KEY" && $2 == "scraper" { print $3 }' <<< "$OUTPUT")"
+COOKIE="$(awk '$1 == "COOKIE" { print $2 }' <<< "$OUTPUT")"
 
 info "zsazsa and misp-scraper configuration"
+# zsazsa derives the cookie name itself when this is empty; filling it in saves
+# a round trip and works with any role.
+if [[ -n "$COOKIE" ]] && grep -qE "^MISP_SESSION_COOKIE_NAME = ''" "$ZSAZSA_CFG"; then
+    set_py "$ZSAZSA_CFG" MISP_SESSION_COOKIE_NAME "'$COOKIE'"
+    echo "    zsazsa: MISP_SESSION_COOKIE_NAME = $COOKIE"
+    RESTART=1
+fi
 if [[ -n "$ZSAZSA_KEY" ]]; then
     set_py "$ZSAZSA_CFG" MISP_KEY "'$ZSAZSA_KEY'"
     set_py "$ZSAZSA_CFG" MISP_WEBAPP_KEY "'$ZSAZSA_KEY'"
@@ -74,7 +85,7 @@ if grep -qF "$ADMIN_KEY" "$ZSAZSA_CFG" "$SCRAPER_CFG"; then
     warn "The administrator's key is still in use: $(grep -lF "$ADMIN_KEY" "$ZSAZSA_CFG" "$SCRAPER_CFG" | xargs -n1 basename | xargs). Run again with --new-keys."
 fi
 
-if [[ -n "$ZSAZSA_KEY$SCRAPER_KEY" ]]; then
+if [[ -n "$ZSAZSA_KEY$SCRAPER_KEY" || -n "${RESTART:-}" ]]; then
     info "Restarting zsazsa and misp-scraper"
     (cd "$ZSAZSA_DIR" && docker compose restart)
 fi

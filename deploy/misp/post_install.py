@@ -8,11 +8,14 @@ Environment (set by scripts/post-install.sh; ADMIN_KEY comes from misp-core):
     MISP_URL    MISP as seen from misp-core, e.g. https://misp-nginx:8443
     TAXONOMIES  namespaces, space separated; namespace=tag,tag enables only
                 those tags of it and hides the others that exist
-    USERS       name=email=allowed-ip-range, space separated (range may be empty)
-    ROLE        role of the new users
+    USERS       name=email=allowed-ip-range=role, space separated (range and
+                role may be empty); a role in CUSTOM_ROLES is created when missing,
+                and an existing user gets the role it lacks
+    ROLE        role when a user names none
     NEW_KEYS    "1": also add a key to users that already exist
 
-Prints "KEY <name> <authkey>" for every key it creates.
+Prints "KEY <name> <authkey>" for every key it creates, and "COOKIE <name>"
+with MISP's session cookie name.
 """
 
 import json
@@ -131,24 +134,49 @@ def hide_other_tags(taxonomy_id, namespace, keep):
     print(f"taxonomy {namespace}: hid {', '.join(others)}")
 
 
-def users(specs, role_name, new_keys):
+# Roles this script creates when a user asks for one MISP does not have.
+CUSTOM_ROLES = {
+    # What zsazsa checks its key for (webapp/misp_store.py) and nothing more: no
+    # site admin and, unlike Org Admin, no user management. perm_sync lets it
+    # read the instance UUID its session cookie name is made from.
+    "zsazsa": {
+        "permission": 3,  # add, modify, modify the organisation's, publish
+        "perm_auth": 1, "perm_tagger": 1, "perm_tag_editor": 1, "perm_sync": 1,
+        "perm_sighting": 1, "perm_galaxy_editor": 1, "perm_analyst_data": 1,
+    },
+}
+
+
+def users(specs, default_role, new_keys):
     roles = {unwrap(r, "Role")["name"]: unwrap(r, "Role")["id"] for r in call("/roles/index") or []}
-    if role_name not in roles:
-        sys.exit(f"role {role_name!r} not found; roles: {', '.join(sorted(roles))}")
     org_id = unwrap(call("/users/view/me"), "User")["org_id"]
-    existing = {unwrap(u, "User")["email"].lower(): unwrap(u, "User")["id"]
+    existing = {unwrap(u, "User")["email"].lower(): unwrap(u, "User")
                 for u in call("/admin/users/index") or []}
 
     for spec in specs:
-        name, email, allowed = (spec.split("=") + ["", ""])[:3]
-        user_id = existing.get(email.lower())
-        if user_id:
-            print(f"user {email}: exists (id {user_id})")
+        name, email, allowed, role_name = (spec.split("=") + ["", "", ""])[:4]
+        role_name = role_name or default_role
+        if role_name not in roles:
+            if role_name not in CUSTOM_ROLES:
+                sys.exit(f"role {role_name!r} not found; roles: {', '.join(sorted(roles))}")
+            created = call("/admin/roles/add", {"Role": {"name": role_name, **CUSTOM_ROLES[role_name]}})
+            roles[role_name] = unwrap(created, "Role")["id"]
+            print(f"role {role_name}: created (id {roles[role_name]})")
+        role_id = roles[role_name]
+
+        user = existing.get(email.lower())
+        if user:
+            user_id = user["id"]
+            if str(user.get("role_id")) != str(role_id):
+                call(f"/admin/users/edit/{user_id}", {"User": {"role_id": role_id}})
+                print(f"user {email}: role changed to {role_name}")
+            else:
+                print(f"user {email}: exists (id {user_id}, role {role_name})")
             if not new_keys:
                 continue
         else:
             created = call("/admin/users/add", {"User": {
-                "email": email, "org_id": org_id, "role_id": roles[role_name],
+                "email": email, "org_id": org_id, "role_id": role_id,
                 "password": password(), "change_pw": 0, "termsaccepted": 1,
                 "autoalert": 0, "contactalert": 0, "notify": 0,
             }})
@@ -163,7 +191,17 @@ def users(specs, role_name, new_keys):
         print(f"KEY {name} {authkey['authkey_raw']}")
 
 
+def cookie_name():
+    # MISP names its session cookie after the instance UUID, which getVersion
+    # only shows to sync users and site admins.
+    version = call("/servers/getVersion", fatal=False)
+    uuid = version.get("uuid") if isinstance(version, dict) else None
+    if uuid:
+        print(f"COOKIE MISP-{uuid}")
+
+
 wait_for_misp()
 taxonomies(os.environ.get("TAXONOMIES", "").split())
 users(os.environ.get("USERS", "").split(), os.environ.get("ROLE", "Org Admin"),
       os.environ.get("NEW_KEYS") == "1")
+cookie_name()

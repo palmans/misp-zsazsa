@@ -201,10 +201,12 @@ bash scripts/post-install.sh
 zsazsa and misp-scraper start with the key of the MISP administrator, a site admin: whoever obtains it controls all of MISP, and everything both tools do is logged under the administrator's name. This script, run once:
 
 - enables the taxonomies they tag with: `tlp`, `workflow`, `admiralty-scale` and `cti-evaluation`. Of `tlp` only the TLP 2.0 levels are enabled (`tlp:red`, `tlp:amber`, `tlp:amber+strict`, `tlp:green`, `tlp:clear`); `tlp:white`, `tlp:ex:chr` and `tlp:unclear` stay off and are hidden if they exist. Change `TAXONOMIES` in the script to choose otherwise;
-- creates a MISP user for each, `<admin>+zsazsa@<domain>` and `<admin>+scraper@<domain>` (role *Org Admin*, not site admin), with an API key that only works from the address that tool calls from: the Docker host's address for zsazsa (it goes through the reverse proxy), misp-docker's network for misp-scraper;
+- creates a MISP user for each, `<admin>+zsazsa@<domain>` and `<admin>+scraper@<domain>`, with an API key that only works from the address that tool calls from: the Docker host's address for zsazsa (it goes through the reverse proxy), misp-docker's network for misp-scraper;
 - puts the keys in their configuration and restarts them.
 
 Existing users are left alone; `--new-keys` adds a fresh key to them (revoke the old one under *Administration → List Users →* the user *→ Auth keys*), `--no-ip-limit` leaves the keys unrestricted.
+
+Roles: misp-scraper gets *Org Admin*. zsazsa gets a role of its own, *zsazsa*, which the script creates with exactly what zsazsa checks its key for: add, modify and publish events (also those of the organisation), tag them and create tags, sightings, galaxies and analyst data, API access, and `perm_sync` (zsazsa reads MISP's instance UUID with it, for the session cookie name). It has no site admin and, unlike *Org Admin*, cannot manage users. `perm_sync` would also let the key push events in the name of another organisation; the key only works from the Docker host's address. Running the script again gives an existing zsazsa user this role. The script also fills in zsazsa's `MISP_SESSION_COOKIE_NAME` when it is empty.
 
 ### 8. Finish the setup in the browser
 
@@ -234,7 +236,7 @@ If you restrict access with an access list on the reverse proxy, allow the Docke
 2. **Diagnostics** — *Administration → Server Settings & Maintenance → Diagnostics*. What remains after this setup is expected: see [MISP diagnostics](#misp-diagnostics).
 3. **zsazsa** — open `https://<MISP_HOSTNAME>/zsazsa/`. As a MISP site admin you get zsazsa's setup wizard (also at `/zsazsa/config/setup`): organisation, collection sources, AI, focus points and notifications. AI features need an OpenAI API key or a local OpenAI-compatible endpoint (e.g. Ollama).
 4. **Single sign-on** — in zsazsa, *Settings → System → Single sign-on*: save once (zsazsa then detects MISP's cookie name) and press **Test single sign-on**. Redis host, password and database are already filled in by `init.sh`.
-5. **Dedicated API keys** — done by `scripts/post-install.sh` ([installation step 7](#7-taxonomies-and-dedicated-api-keys)). To do it by hand: *Administration → Add User* (role *Org Admin*), then the user's *Auth keys → Add authentication key*, and put the key in zsazsa's *Settings → Connections* and *Sources → MISP scraper*, and in `misp_key` of `zsazsa/docker/volumes/scraper-config/scraper.py`.
+5. **Dedicated API keys** — done by `scripts/post-install.sh` ([installation step 7](#7-taxonomies-and-dedicated-api-keys)). To do it by hand: *Administration → Add User* (role *Org Admin*, or for zsazsa a role with the permissions under [step 7](#7-taxonomies-and-dedicated-api-keys)), then the user's *Auth keys → Add authentication key*, and put the key in zsazsa's *Settings → Connections* and *Sources → MISP scraper*, and in `misp_key` of `zsazsa/docker/volumes/scraper-config/scraper.py`.
 6. **Feeds** — edit `zsazsa/docker/volumes/scraper-config/feedlist.json` and restart `scraper-cron`, or trigger a run now (see below).
 
 ## Day-to-day operations
