@@ -50,7 +50,7 @@ The three folders `misp-docker/`, `misp-scraper/` and `zsazsa/` are unmodified c
 ```
 
 - **No ports are published on the Docker host.** `misp-nginx` gets an address of its own on the LAN through an `ipvlan` (or `macvlan`) Docker network, so it never conflicts with ports 80/443 or anything else running on the host. It is the only container reachable from the LAN.
-- **zsazsa is served under MISP's own hostname**, at `https://<MISP_HOSTNAME>/zsazsa/`. `misp-nginx` proxies that path to the zsazsa container. This is required for zsazsa's single sign-on: zsazsa identifies the analyst from MISP's session cookie, which the browser only sends to MISP's hostname.
+- **zsazsa is served under MISP's own hostname**, at `https://<MISP_HOSTNAME>/zsazsa/`. `misp-nginx` proxies that path to the zsazsa container. This is required for zsazsa's single sign-on: zsazsa identifies the analyst from MISP's session cookie, which the browser only sends to MISP's hostname. Opening a zsazsa page without a MISP session shows MISP's login page and returns to that zsazsa page after the login; logging in on MISP itself lands in MISP as usual.
 - **One Redis** (MISP's) is shared: zsazsa reads MISP's PHP sessions from it (single sign-on), sends article URLs to misp-scraper through it, and keeps its background-job state in it.
 - zsazsa calls the MISP API on MISP's public URL, through the reverse proxy (needed for the single sign-on login redirect). misp-scraper talks to `misp-nginx` directly on the internal network.
 - All containers restart automatically after a reboot of the Docker host (`restart: always` / `unless-stopped`).
@@ -63,7 +63,7 @@ The three folders `misp-docker/`, `misp-scraper/` and `zsazsa/` are unmodified c
 | `deploy/settings.env` | **Your** site settings | no |
 | `deploy/misp-docker.override.yml` | Compose override for misp-docker: no host ports, LAN address, configurable ports, zsazsa route | yes |
 | `deploy/zsazsa.override.yml` | Compose override for zsazsa: no host ports, MISP reached through the proxy, restart policy | yes |
-| `deploy/nginx/05-zsazsa.sh` | Adds the `/zsazsa/` location to misp-nginx on every start | yes |
+| `deploy/nginx/05-zsazsa.sh` | Adds the `/zsazsa/` location, and the return to zsazsa after a MISP login, to misp-nginx on every start | yes |
 | `deploy/misp/customize_misp.sh` | Runs in misp-core on every start: `Security.force_https`, mail signing, default distribution, PHP session hardening | yes |
 | `deploy/misp/post_install.py` | Taxonomies, users and API keys through MISP's API; run by `scripts/post-install.sh` | yes |
 | `scripts/post-install.sh` | Once after the first start: taxonomies and dedicated API keys for zsazsa and misp-scraper | yes |
@@ -398,6 +398,7 @@ misp-nginx sits on two networks. Its replies to clients outside the LAN subnet f
 
 - *`/zsazsa/` returns 404* — the location is missing in misp-nginx. `docker compose logs misp-nginx | grep 05-zsazsa` shows whether the script ran; *"Ignoring ..., not executable"* means `chmod +x deploy/nginx/05-zsazsa.sh` (done by `init.sh`), then `docker compose up -d --force-recreate misp-nginx`.
 - *`/zsazsa/` returns 502/504* — the zsazsa web app is down or not on misp-docker's network: `docker compose ps` in `zsazsa/docker/`, `docker network inspect misp-docker_default`. Start MISP before zsazsa: zsazsa joins MISP's network.
+- *After logging in you land in zsazsa instead of MISP* — you opened a zsazsa page without a session in the 15 minutes before; misp-nginx remembered it in the `zsazsa_return` cookie. It is used once.
 - *zsazsa does not recognise you / login loop* — use **Test single sign-on** on zsazsa's Settings page; zsazsa must be opened under `https://<MISP_HOSTNAME>/zsazsa/`. `WRONGPASS` in `analyser.log` means the `MISP_SESSION_REDIS_PASSWORD` in zsazsa's configuration differs from `REDIS_PASSWORD` in `misp-docker/.env`.
 - *`CERTIFICATE_VERIFY_FAILED`* — the reverse proxy's certificate is not publicly trusted: set `MISP_VERIFYCERT` and `MISP_WEBAPP_VERIFYCERT` to `False` in `zsazsa/docker/volumes/config/__init__.py` and restart.
 - *Connection refused/timeouts to MISP* — check `PROXY_IP` and `MISP_HOSTNAME` in `zsazsa/docker/.env` (they become an `/etc/hosts` entry in the containers) and any access list on the reverse proxy.
