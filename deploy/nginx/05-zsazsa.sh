@@ -30,6 +30,9 @@ location ^~ /zsazsa/ {
     proxy_set_header X-Forwarded-Prefix /zsazsa;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_read_timeout 300s;
+    # Keeps a relative Location relative. nginx would otherwise make it absolute
+    # with its own port, which only the reverse proxy reaches.
+    absolute_redirect off;
     # Without a MISP session zsazsa sends the browser to MISP's login page,
     # which forgets where it came from. /zsazsa-login remembers the page.
     proxy_redirect ~^https?://[^/]+/users/login$ /zsazsa-login$request_uri;
