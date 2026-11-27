@@ -1,0 +1,37 @@
+diff --git a/misp-scraper.py b/misp-scraper.py
+index d694cb1..5af24ec 100644
+--- a/misp-scraper.py
++++ b/misp-scraper.py
+@@ -68,6 +68,14 @@ class MispScraperFeedparser():
+                 return time.strftime("%Y-%m-%d", parsed)
+         return False
+ 
++    def _resolve_link(self, link) -> str:
++        """ The page behind a link that only redirects with JavaScript, which is not followed when scraping """
++        # NCSC-NL: /advisory?id=NCSC-2026-0525 -> /2026/ncsc-2026-0525.html
++        match = re.match(r"^https://advisories\.ncsc\.nl/advisory\?id=(NCSC-(\d{4})-\d+)$", link, re.IGNORECASE)
++        if match:
++            return "https://advisories.ncsc.nl/{}/{}.html".format(match.group(2), match.group(1).lower())
++        return link
++
+     def _get_urls_feed(self, rss_feed, rss_feed_title, rss_feed_tags) -> dict:
+         """ Get all the URLs contained in a feed"""
+         urls = []
+@@ -94,7 +102,7 @@ class MispScraperFeedparser():
+                         feed_entries = len(rss_feed_content)
+                         for entry in rss_feed_content.entries:
+                             title = entry.get('title', 'No title')
+-                            link = entry.get('link', False)
++                            link = self._resolve_link(entry.get('link', False) or '') or False
+                             published = self._get_entry_date(entry)
+                             if link:
+                                 logging.debug("Found URL {} {} {}".format(rss_feed, title, link))
+@@ -104,7 +112,7 @@ class MispScraperFeedparser():
+                     if len(rss_feed_content) > 0:
+                         for entry in rss_feed_content.entries:
+                             title = entry.get('title', 'No title')
+-                            link = entry.get('link', False)
++                            link = self._resolve_link(entry.get('link', False) or '') or False
+                             published = self._get_entry_date(entry)
+                             if link:
+                                 logging.debug("Found URL - despite malformed XML- {} {} {}".format(rss_feed, title, link))

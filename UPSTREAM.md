@@ -1,8 +1,9 @@
 # Upstream sources
 
-These folders are unmodified copies of their upstream repositories, written by
-`scripts/update-upstream.sh`. Changes made in them are lost on the next
-update: deployment-specific changes belong in `deploy/`.
+These folders are copies of their upstream repositories, written by
+`scripts/update-upstream.sh`, with the patches in `deploy/patches/<folder>/`
+applied. Changes made in them are lost on the next update: deployment-specific
+changes belong in `deploy/`.
 
 | Folder | Repository | Commit | Date |
 |---|---|---|---|

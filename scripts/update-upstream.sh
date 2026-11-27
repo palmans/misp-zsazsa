@@ -24,6 +24,7 @@ trap 'rm -rf "$WORK"; [[ -d "$STASH" ]] && echo "Interrupted: kept files are in 
 [[ -e "$STASH" ]] && { echo "$STASH exists: a previous update was interrupted. Restore its files first." >&2; exit 1; }
 
 ROWS=""
+FAILED=()
 for component in "${COMPONENTS[@]}"; do
     IFS='|' read -r dir repo branch keep <<< "$component"
     echo "==> $dir"
@@ -43,6 +44,16 @@ for component in "${COMPONENTS[@]}"; do
     mkdir -p "$ROOT/$dir"
     git -C "$WORK/$dir" -c core.autocrlf=false archive --format=tar HEAD | tar -x -C "$ROOT/$dir"
 
+    # Fixes of this deployment that upstream does not have (yet).
+    for patch in "$ROOT/deploy/patches/$dir"/*.patch; do
+        [[ -e "$patch" ]] || continue
+        if git -C "$ROOT" apply --directory="$dir" "$patch"; then
+            echo "    patched: ${patch#"$ROOT/"}"
+        else
+            FAILED+=("${patch#"$ROOT/"}")
+        fi
+    done
+
     for path in $keep; do
         if [[ -e "$STASH/$dir/$path" ]]; then
             mkdir -p "$(dirname "$ROOT/$dir/$path")"
@@ -60,14 +71,22 @@ rmdir "$STASH"
 cat > "$ROOT/UPSTREAM.md" << EOF
 # Upstream sources
 
-These folders are unmodified copies of their upstream repositories, written by
-\`scripts/update-upstream.sh\`. Changes made in them are lost on the next
-update: deployment-specific changes belong in \`deploy/\`.
+These folders are copies of their upstream repositories, written by
+\`scripts/update-upstream.sh\`, with the patches in \`deploy/patches/<folder>/\`
+applied. Changes made in them are lost on the next update: deployment-specific
+changes belong in \`deploy/\`.
 
 | Folder | Repository | Commit | Date |
 |---|---|---|---|
 $ROWS
 EOF
+
+if (( ${#FAILED[@]} )); then
+    echo
+    echo "These patches did not apply; upstream changed the code or fixed it itself:" >&2
+    printf '  %s\n' "${FAILED[@]}" >&2
+    echo "Check upstream, then update or remove the patch." >&2
+fi
 
 cat << 'EOF'
 
