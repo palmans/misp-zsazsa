@@ -21,9 +21,9 @@
 			"url": "https://www.darkreading.com/rss.xml"
 		},
 		{
-			"title": "TAG",
+			"title": "Google-GTIG",
             "tags": ["admiralty-scale:source-reliability=\"b\""],
-			"url": "https://blog.google/threat-analysis-group/rss/"
+			"url": "https://feeds.feedburner.com/threatintelligence/pvexyqv7v0v"
 		},
 		{
 			"title": "SentinelOne",

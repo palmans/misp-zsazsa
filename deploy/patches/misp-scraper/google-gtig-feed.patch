@@ -1,0 +1,16 @@
+diff --git a/feedlist.json b/feedlist.json
+index d910093..93cbd8f 100644
+--- a/feedlist.json
++++ b/feedlist.json
+@@ -21,9 +21,9 @@
+ 			"url": "https://www.darkreading.com/rss.xml"
+ 		},
+ 		{
+-			"title": "TAG",
++			"title": "Google-GTIG",
+             "tags": ["admiralty-scale:source-reliability=\"b\""],
+-			"url": "https://blog.google/threat-analysis-group/rss/"
++			"url": "https://feeds.feedburner.com/threatintelligence/pvexyqv7v0v"
+ 		},
+ 		{
+ 			"title": "SentinelOne",
