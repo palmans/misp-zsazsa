@@ -105,7 +105,8 @@ NEW=$(git_ rev-parse HEAD)
 # --- 2.-4. Configuration and containers ------------------------------------------
 
 info "scripts/init.sh"
-bash "$ROOT/scripts/init.sh" | sed 's/^/    /'
+# Without its "next steps" for a new installation.
+bash "$ROOT/scripts/init.sh" | sed -e '/^Done\. Next steps/,$d' -e 's/^/    /'
 
 MISP() { (cd "$MISP_DIR" && docker compose "$@"); }
 ZSAZSA() { (cd "$ZSAZSA_DIR" && docker compose "$@"); }

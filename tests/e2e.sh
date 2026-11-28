@@ -441,7 +441,8 @@ if [[ -n "$UPGRADE_FROM" ]]; then
     else
         fail "scripts/update.sh ${update[*]}" "$(tail -n 40 <<< "$out")"
     fi
-    printf '%s\n' "$out" | grep -vE '^ +(Container|Image|#[0-9])' | sed 's/^/       /'
+    # Without the progress of docker compose.
+    printf '%s\n' "$out" | grep -vE '^( *(Container|Image|Network|Volume) |#[0-9]+ |$)' | sed 's/^/       /'
     expect_eq "update.sh brought the checkout to the commit under test" "$(g rev-parse "$TARGET")" "$(sgit rev-parse HEAD)"
     verify "$(g rev-parse --short "$TARGET") (after the update)"
     section "after the update: data"
