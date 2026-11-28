@@ -374,7 +374,7 @@ cd misp-docker && docker compose exec misp-nginx nginx -T | grep -A12 'zsazsa CT
 docker compose exec redis sh -c 'valkey-cli -a "$REDIS_PASSWORD" --no-auth-warning ping'
 
 # zsazsa reaches MISP through the reverse proxy
-cd zsazsa/docker && docker compose exec webapp python -c "import config, urllib.request; print(urllib.request.urlopen(config.MISP_WEBAPP_URL + '/users/login').status)"
+cd zsazsa/docker && docker compose exec webapp python -c "import config, ssl, urllib.request; c = None if config.MISP_WEBAPP_VERIFYCERT else ssl._create_unverified_context(); print(urllib.request.urlopen(config.MISP_WEBAPP_URL + '/users/login', context=c).status)"
 ```
 
 ### misp-nginx does not start

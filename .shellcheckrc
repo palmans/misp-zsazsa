@@ -1,0 +1,4 @@
+# ShellCheck settings for the scripts of this repository (tests/check.sh runs it).
+# Follow the files the scripts source (scripts/lib.sh, tests/lib.sh).
+source-path=SCRIPTDIR
+external-sources=true
