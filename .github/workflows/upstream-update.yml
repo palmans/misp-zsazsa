@@ -3,9 +3,15 @@
 # changes. Nothing happens when upstream has not changed.
 #
 # Then it runs the Tests workflow (tests/check.sh, tests/e2e.sh) on that pull
-# request and reports the result on it, as the status "Upstream update / tests"
-# and, when they fail, in a comment. A pull request opened with GITHUB_TOKEN
-# starts no pull_request workflows of its own, hence this call.
+# request and reports the result on it, as the status "Upstream update / tests".
+# A pull request opened with GITHUB_TOKEN starts no pull_request workflows of
+# its own, hence this call.
+#
+# Once the tests are done it requests a review from, and mentions in a comment,
+# the GitHub users in the repository variable UPSTREAM_NOTIFY (Settings →
+# Secrets and variables → Actions → Variables; logins separated by spaces,
+# default epalmans). That notifies them also when an open pull request was only
+# updated, which GitHub does not do by itself.
 #
 # Needs: Settings → Actions → General → Workflow permissions →
 # "Allow GitHub Actions to create and approve pull requests".
@@ -33,6 +39,7 @@ jobs:
       operation: ${{ steps.pr.outputs.pull-request-operation }}
       number: ${{ steps.pr.outputs.pull-request-number }}
       sha: ${{ steps.pr.outputs.pull-request-head-sha }}
+      title: ${{ steps.describe.outputs.title }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -100,12 +107,15 @@ jobs:
       statuses: write
       pull-requests: write
     steps:
-      - name: Report the result on the pull request
+      - name: Report the result on the pull request and notify
         env:
           GH_TOKEN: ${{ github.token }}
           RESULT: ${{ needs.test.result }}
+          OPERATION: ${{ needs.update.outputs.operation }}
+          TITLE: ${{ needs.update.outputs.title }}
           SHA: ${{ needs.update.outputs.sha }}
           NUMBER: ${{ needs.update.outputs.number }}
+          NOTIFY: ${{ vars.UPSTREAM_NOTIFY || 'epalmans' }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           case "$RESULT" in
@@ -115,10 +125,24 @@ jobs:
           esac
           gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$state" -f context="Upstream update / tests" \
             -f target_url="$RUN" -f description="$description"
-          if [[ "$state" != success ]]; then
-            body=$(printf '%s\n\n%s\n' \
-              "⚠️ **The tests of this update did not pass** ($RESULT) for ${SHA:0:7}: [workflow run]($RUN)." \
-              "The job summaries list what failed; the e2e jobs print the container logs and the report of \`scripts/report.sh\` under *Logs*. Fix it on this branch (a push runs the tests again), or rerun the workflow.")
-            gh api "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" -f body="$body" > /dev/null
+
+          # Review requested: the pull request shows up under their review requests.
+          mentions=""
+          for login in ${NOTIFY//,/ }; do
+            login=${login#@}
+            mentions+="@$login "
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER/requested_reviewers" -f "reviewers[]=$login" > /dev/null ||
+              echo "::warning::Could not request a review from $login (not a collaborator?)"
+          done
+
+          # A comment that mentions them: a notification, also for an update of an open pull request.
+          what=$([[ "$OPERATION" == created ]] && echo "New upstream update" || echo "This upstream update was updated")
+          if [[ "$state" == success ]]; then
+            first="✅ ${mentions}${what} and its tests passed (${SHA:0:7}, [workflow run]($RUN)): **$TITLE**."
+            next="Review and merge it, then on the Docker host: \`cd /opt/misp-zsazsa && sudo bash scripts/update.sh\`"
+          else
+            first="⚠️ ${mentions}${what}, but **its tests did not pass** ($RESULT, ${SHA:0:7}, [workflow run]($RUN)): **$TITLE**."
+            next="The job summaries list what failed; the e2e jobs print the container logs and the report of \`scripts/report.sh\` under *Logs*. Fix it on this branch (a push runs the tests again), or rerun the workflow."
           fi
+          gh api "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" -f body="$(printf '%s\n\n%s\n' "$first" "$next")" > /dev/null
           echo "$description" >> "$GITHUB_STEP_SUMMARY"
