@@ -74,6 +74,7 @@ The three folders `misp-docker/`, `misp-scraper/` and `zsazsa/` are copies of th
 | `deploy/reverse-proxy.example.conf` | Example configuration for a plain nginx reverse proxy | yes |
 | `scripts/init.sh` | Generates all configuration, passwords, keys and the certificate from `deploy/settings.env` | yes |
 | `scripts/update-upstream.sh` | Refreshes the three upstream folders and applies `deploy/patches/` | yes |
+| `.github/workflows/upstream-update.yml` | Runs `update-upstream.sh` every Monday and opens a pull request with the upstream changes | yes |
 | `misp-docker/.env`, `misp-docker/ssl/` | Generated MISP configuration, passwords and certificate | no |
 | `misp-docker/{configs,files,gnupg,logs}/` | MISP runtime data (created by the containers) | no |
 | `zsazsa/docker/.env` | Generated zsazsa compose settings | no |
@@ -273,6 +274,10 @@ After changing `deploy/settings.env`, run `bash scripts/init.sh` and then `docke
 The stacks show up in Portainer as stacks created outside Portainer ("limited" control): manage them with the commands above.
 
 ## Updating
+
+The *Upstream update* workflow (`.github/workflows/upstream-update.yml`) runs `scripts/update-upstream.sh` on GitHub every Monday, and on demand under *Actions → Upstream update → Run workflow*. When upstream changed, it opens or updates one pull request on the branch `upstream/update`, with links to the upstream commits, the new MISP image versions, the lines added to zsazsa's CHANGELOG and the patches that no longer apply (label `patch-failed`). Review and merge it, then run the steps below from `git pull` on: skip `update-upstream.sh`, the pull request already did that. It needs *Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests*.
+
+By hand:
 
 ```bash
 cd /opt/misp-zsazsa
