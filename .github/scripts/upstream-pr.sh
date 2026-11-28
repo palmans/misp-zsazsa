@@ -38,6 +38,9 @@ fi
 
 echo "Automatic update by \`scripts/update-upstream.sh\` (workflow *Upstream update*)."
 echo
+echo "The workflow then installs this branch on a test runner, fresh and as an update of the base branch"
+echo "(\`tests/check.sh\`, \`tests/e2e.sh\`): see the status *Upstream update / tests* before merging."
+echo
 echo "| Folder | Change | Upstream commits | Files |"
 echo "|---|---|---|---|"
 while read -r dir repo sha date; do
