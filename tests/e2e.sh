@@ -53,6 +53,7 @@ while (( $# )); do
 done
 
 die() {
+    SOFT=0
     fail "$*"
     exit 1
 }
@@ -246,6 +247,12 @@ start_stacks() {
         check "misp-docker: docker compose pull" misp pull -q
     fi
     # The first start of MISP (database, galaxies, warninglists) takes minutes.
+    # misp-modules' health check gives up after seconds, which a slow start of
+    # it can miss; Compose then does not start misp-core. Once more, as one
+    # would by hand (scripts/update.sh does the same).
+    if ! misp up -d --wait --wait-timeout 1200 > "$WORK/up.log" 2>&1; then
+        info "misp-docker: docker compose up failed, once more: $(tail -n 1 "$WORK/up.log")"
+    fi
     check "misp-docker: docker compose up -d (until healthy)" misp up -d --wait --wait-timeout 1200
     check "zsazsa: docker compose ${build[*]}" zsazsa "${build[@]}"
     check "zsazsa: docker compose up -d (until running and healthy)" zsazsa up -d --wait --wait-timeout 600
@@ -358,8 +365,19 @@ print(misp.get_user("me", pythonify=True).email)
 PY
     )
     expect_match "misp-scraper calls misp-nginx with its own key" "${ADMIN_EMAIL%@*}\+scraper@${ADMIN_EMAIL#*@}$" "$out"
-    out=$(misp exec -T redis sh -c 'valkey-cli -a "$REDIS_PASSWORD" --no-auth-warning PUBSUB NUMSUB urls' 2>&1)
-    expect_match "scraper-subscribe listens for zsazsa's URLs on Redis" $'^urls\n[1-9]' "$out"
+    # It connects to MISP first, then subscribes: give a fresh start time.
+    local _
+    for _ in $(seq 24); do
+        out=$(misp exec -T redis sh -c 'valkey-cli -a "$REDIS_PASSWORD" --no-auth-warning PUBSUB NUMSUB urls' 2>&1)
+        [[ "$out" =~ ^urls$'\n'[1-9] ]] && break
+        sleep 5
+    done
+    if [[ "$out" =~ ^urls$'\n'[1-9] ]]; then
+        pass "scraper-subscribe listens for zsazsa's URLs on Redis"
+    else
+        fail "scraper-subscribe listens for zsazsa's URLs on Redis" "PUBSUB NUMSUB: ${out//$'\n'/ }" \
+            "$(zsazsa ps scraper-subscribe 2>&1; zsazsa logs --tail 30 scraper-subscribe 2>&1)"
+    fi
 
     section "$phase: scripts"
     local before after
@@ -411,7 +429,12 @@ misp_api() {
 }
 
 if [[ -n "$UPGRADE_FROM" ]]; then
+    # The version before the update is what runs (and is merged) now: what
+    # fails there is reported, but is not what is under test. It has to be
+    # installed and running, though.
+    SOFT=1
     verify "$(g rev-parse --short "$UPGRADE_FROM") (before the update)"
+    SOFT=0
 
     step "Update to $(g rev-parse --short "$TARGET")"
     EVENT=$(misp_api /events/add -d '{"Event": {"info": "e2e: made before the update", "distribution": 0}}' |

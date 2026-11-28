@@ -114,8 +114,13 @@ ZSAZSA() { (cd "$ZSAZSA_DIR" && docker compose "$@"); }
 info "MISP: $(get_env "$MISP_ENV" CORE_RUNNING_TAG), modules $(get_env "$MISP_ENV" MODULES_RUNNING_TAG)"
 (( IMAGE_PULL )) && MISP pull --quiet
 # A new MISP version updates its database at the start: that can take minutes.
-MISP up -d --wait --wait-timeout 1800 ||
-    die "MISP did not become healthy. See: cd misp-docker && docker compose ps; docker compose logs misp-core"
+# misp-modules' health check gives up after seconds, which a slow start of it
+# can miss; Compose then does not start misp-core. So once more.
+if ! MISP up -d --wait --wait-timeout 1800; then
+    warn "MISP did not come up; trying once more"
+    MISP up -d --wait --wait-timeout 1800 ||
+        die "MISP did not become healthy. See: cd misp-docker && docker compose ps; docker compose logs misp-core"
+fi
 
 info "zsazsa and misp-scraper: build and start"
 if (( IMAGE_PULL )); then ZSAZSA build --pull; else ZSAZSA build; fi

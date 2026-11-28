@@ -8,6 +8,11 @@ REPO="$(cd "$TESTS/.." && pwd)"
 PASSED=0
 FAILED=0
 FAILURES=()
+# With SOFT=1 a failed check is a warning: it is reported, but does not fail
+# the run (tests/e2e.sh, for the version before an update).
+SOFT=0
+WARNED=0
+WARNINGS=()
 SECTION=""
 
 if [[ -t 1 || -n "${GITHUB_ACTIONS:-}" ]]; then
@@ -30,18 +35,25 @@ skip() { printf '  %sskip%s %s\n' "$YELLOW" "$OFF" "$*"; }
 
 # fail DESCRIPTION [DETAIL...]: the details are printed indented below it.
 fail() {
-    local what=$1
+    local what=$1 level=error
     shift
-    FAILED=$((FAILED + 1))
-    FAILURES+=("$SECTION: $what")
-    printf '  %sFAIL%s %s\n' "$RED" "$OFF" "$what"
+    if (( SOFT )); then
+        level=warning
+        WARNED=$((WARNED + 1))
+        WARNINGS+=("$SECTION: $what")
+        printf '  %sWARN%s %s\n' "$YELLOW" "$OFF" "$what"
+    else
+        FAILED=$((FAILED + 1))
+        FAILURES+=("$SECTION: $what")
+        printf '  %sFAIL%s %s\n' "$RED" "$OFF" "$what"
+    fi
     local detail
     for detail in "$@"; do
         [[ -n "$detail" ]] && sed 's/^/       /' <<< "$detail"
     done
     if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
         # One line: an annotation ends at the first newline.
-        printf '::error title=%s::%s\n' "${SECTION//[:,]/ }" "$what"
+        printf '::%s title=%s::%s\n' "$level" "${SECTION//[:,]/ }" "$what"
     fi
     return 0
 }
@@ -103,6 +115,12 @@ finish() {
     for line in "${FAILURES[@]}"; do
         printf '  %sFAIL%s %s\n' "$RED" "$OFF" "$line"
     done
+    if (( WARNED )); then
+        printf '%s%d warning(s), not counted:%s\n' "$B" "$WARNED" "$OFF"
+        for line in "${WARNINGS[@]}"; do
+            printf '  %sWARN%s %s\n' "$YELLOW" "$OFF" "$line"
+        done
+    fi
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         {
             if (( FAILED )); then
@@ -113,6 +131,12 @@ finish() {
                 echo "### ✅ $title: all $PASSED checks passed"
             fi
             echo
+            if (( WARNED )); then
+                echo "⚠️ $WARNED warning(s), not counted:"
+                echo
+                for line in "${WARNINGS[@]}"; do echo "- $line"; done
+                echo
+            fi
         } >> "$GITHUB_STEP_SUMMARY"
     fi
     (( FAILED == 0 ))
