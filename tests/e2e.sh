@@ -75,7 +75,8 @@ HTTP_PORT=8080
 PROXY_IMAGE=nginx:1.29-alpine
 PROXY_NAME=misp-zsazsa-e2e-proxy
 LOGS=${E2E_LOGS:-$REPO/e2e-logs}
-SANDBOX=""
+SANDBOX=""   # the copy of the repository (a git worktree)
+WORK=""      # files of the test itself
 IPTABLES_RULES=()
 
 # --- Clean up ------------------------------------------------------------------
@@ -117,9 +118,9 @@ cleanup() {
         done
         if [[ -n "$SANDBOX" ]]; then
             g worktree remove --force "$SANDBOX" > /dev/null 2>&1
-            rm -rf "$SANDBOX"
             g worktree prune
         fi
+        [[ -n "$WORK" ]] && rm -rf "$WORK"
     fi
     finish "tests/e2e.sh${UPGRADE_FROM:+ (upgrade from $UPGRADE_FROM)}"
     local finished=$?
@@ -161,8 +162,8 @@ trap 'exit 130' INT TERM
 
 # --- Install ---------------------------------------------------------------------
 
-SANDBOX=$(mktemp -d /tmp/misp-zsazsa-e2e.XXXXXX)
-rmdir "$SANDBOX"
+WORK=$(mktemp -d /tmp/misp-zsazsa-e2e.XXXXXX)
+SANDBOX="$WORK/repo"
 step "Copy of $(g rev-parse --short "$FIRST") in $SANDBOX"
 g worktree add -q --detach "$SANDBOX" "$FIRST" || die "git worktree add"
 
@@ -214,7 +215,7 @@ lan_network() {
 }
 
 reverse_proxy() {
-    local dir="$SANDBOX/.e2e-proxy" conf
+    local dir="$WORK/proxy" conf
     mkdir -p "$dir/certs"
     conf=$(sed -e "s/misp\.example\.com/$HOSTNAME_/g" -e "s/192\.168\.1\.19:8443/$LAN_IP:$HTTPS_PORT/g" \
         "$SANDBOX/deploy/reverse-proxy.example.conf")
@@ -369,31 +370,40 @@ PY
     expect_eq "post-install.sh again changes no configuration" "$before" "$after"
     out=$(bash "$SANDBOX/scripts/sync-prompts.sh" 2>&1)
     expect_match "sync-prompts.sh: the prompts match the image" 'All prompts match' "$out"
-    if out=$(bash "$SANDBOX/scripts/report.sh" "$SANDBOX/report.txt" 2>&1); then
+    if out=$(bash "$SANDBOX/scripts/report.sh" "$WORK/report.txt" 2>&1); then
         pass "report.sh"
         local secret leaked=()
         for secret in "$ADMIN_KEY" "$ADMIN_PASSWORD" "$(env_value "$MENV" REDIS_PASSWORD)" \
             "$(env_value "$MENV" MYSQL_ROOT_PASSWORD)" "$(py_value "$ZCFG" MISP_KEY | tr -d "'")" \
             "$(py_value "$ZCFG" SECRET_KEY | tr -d "'")"; do
-            grep -qF "$secret" "$SANDBOX/report.txt" && leaked+=("${secret:0:4}...")
+            grep -qF "$secret" "$WORK/report.txt" && leaked+=("${secret:0:4}...")
         done
         expect_eq "report.sh masks passwords and keys" "" "${leaked[*]}"
         expect_match "report.sh: zsazsa reaches MISP through the proxy" "https://$HOSTNAME_ 200" \
-            "$(grep -A 3 'zsazsa reaches MISP' "$SANDBOX/report.txt")"
+            "$(grep -A 3 'zsazsa reaches MISP' "$WORK/report.txt")"
     else
         fail "report.sh" "$(tail -n 20 <<< "$out")"
     fi
     # README.md, "Backup and restore".
     if misp exec -T db sh -c 'exec mariadb-dump --single-transaction -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"' |
-        gzip > "$SANDBOX/misp-db.sql.gz" && grep -q 'CREATE TABLE `users`' <(zcat "$SANDBOX/misp-db.sql.gz"); then
+        gzip > "$WORK/misp-db.sql.gz" && grep -q 'CREATE TABLE `users`' <(zcat "$WORK/misp-db.sql.gz"); then
         pass "database backup of README.md"
     else
         fail "database backup of README.md"
     fi
+
+    # What init.sh, the scripts and the containers write must leave the files
+    # git tracks alone (or the next "git pull" fails), and be in .gitignore
+    # (or it shows up to be committed, secrets included).
+    section "$phase: the checkout"
+    out=$(git -c safe.directory='*' -C "$SANDBOX" status --porcelain --untracked-files=no 2>&1)
+    expect_eq "no file git tracks changed (git pull keeps working)" "" "$out"
+    out=$(git -c safe.directory='*' -C "$SANDBOX" status --porcelain --untracked-files=all 2>&1 | grep '^??')
+    expect_eq "every file the deployment wrote is in .gitignore" "" "$out"
 }
 
 misp_api() {
-    curl -sk --resolve "$HOSTNAME_:443:$PROXY_IP" -H "Authorization: $ADMIN_KEY" -H 'Accept: application/json' \
+    curl -sk --noproxy '*' --resolve "$HOSTNAME_:443:$PROXY_IP" -H "Authorization: $ADMIN_KEY" -H 'Accept: application/json' \
         -H 'Content-Type: application/json' "https://$HOSTNAME_$1" "${@:2}"
 }
 

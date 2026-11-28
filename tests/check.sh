@@ -42,7 +42,10 @@ check "python3 compiles deploy/misp/post_install.py" \
     python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' deploy/misp/post_install.py
 
 if command -v shellcheck > /dev/null; then
-    check "shellcheck (warnings and errors)" shellcheck -S warning "${BASH_SCRIPTS[@]}" deploy/nginx/05-zsazsa.sh
+    # The lib.sh files through the scripts that source them.
+    to_lint=()
+    for f in "${BASH_SCRIPTS[@]}"; do [[ "$f" == */lib.sh ]] || to_lint+=("$f"); done
+    check "shellcheck (warnings and errors)" shellcheck -x -S warning "${to_lint[@]}" deploy/nginx/05-zsazsa.sh
 elif [[ -n "${CI:-}" ]]; then
     fail "shellcheck is not installed"
 else
@@ -57,9 +60,12 @@ fi
 
 # misp-core runs customize_misp.sh only when it is executable, and nginx's
 # entrypoint skips scripts in /docker-entrypoint.d that are not: both are
-# mounted from this checkout, so git has to keep the bit.
-for f in deploy/misp/customize_misp.sh deploy/nginx/05-zsazsa.sh scripts/init.sh scripts/post-install.sh \
-    scripts/report.sh scripts/sync-prompts.sh scripts/update-upstream.sh .github/scripts/upstream-pr.sh; do
+# mounted from this checkout, so git has to keep the bit. init.sh also makes
+# them and scripts/*.sh (but lib.sh) executable on the host: a file git has
+# without the bit would count as changed there, and a "git pull" that changes
+# it would fail. tests/e2e.sh checks that the checkout stays clean.
+for f in deploy/misp/customize_misp.sh deploy/nginx/05-zsazsa.sh scripts/*.sh .github/scripts/upstream-pr.sh; do
+    [[ "$f" == */lib.sh ]] && continue
     mode=$(git -c safe.directory='*' ls-files -s -- "$f" | awk '{ print $1 }')
     expect_eq "$f is executable in git" 100755 "${mode:-<not in git>}"
 done
