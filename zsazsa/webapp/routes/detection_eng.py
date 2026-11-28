@@ -25,7 +25,7 @@ from webapp.routes.source_event_utils import (
 from core.rulezet_lookup import validate_rule
 from core.vuln_lookup import CVE_RE
 from webapp import audit, branding, misp_session, misp_store, notify_jobs, product_log
-from webapp.models import STAKEHOLDER_ROLES
+from webapp.models import STAKEHOLDER_ROLES, TLP_LEVELS
 from webapp.utils import TLP_NAMES, matching, md_to_html, ordered_counts, sort_products, tlp_counts, tlp_of
 
 logger = logging.getLogger(__name__)
@@ -82,11 +82,12 @@ def _form_data(form, der_id=""):
         "title": form.get("title", "").strip(),
         "technique": form.getlist("technique"),
         "cve_ids": _cve_ids(form.get("cve_ids", "")),
-        "log_sources": misp_store._split_lines(form.get("log_sources")),
+        # Markdown, kept line for line as typed.
+        "log_sources": form.get("log_sources", "").strip().splitlines(),
         "hypothesis": form.get("hypothesis", "").strip(),
         "expected_output": form.get("expected_output", "").strip(),
         "existing_coverage": misp_store._split_lines(form.get("existing_coverage")),
-        "test_cases": misp_store._split_lines(form.get("test_cases")),
+        "test_cases": form.get("test_cases", "").strip().splitlines(),
         # On edit these two are replaced with the stored values (see
         # wizard_edit): the rule has its own form on the detail page, which
         # knows when it may change.
@@ -112,7 +113,7 @@ def _wizard_context(der=None, source_events=None):
     return {
         "der": der,
         "audiences": misp_store.FIA_AUDIENCES,
-        "tlp_levels": misp_store.FIA_TLP_LEVELS,
+        "tlp_levels": TLP_LEVELS,
         "review_states": misp_store.DER_REVIEW_STATES,
         "priorities": misp_store.DER_PRIORITIES,
         "formats": misp_store.DER_FORMATS,
@@ -621,7 +622,7 @@ def pdf(id):
         pdf_bytes = weasyprint.HTML(string=html).write_pdf()
     except Exception as exc:
         logger.warning("pdf: weasyprint failed for DER %s: %s", id, exc)
-        return f"PDF generation failed: {exc}", 500
+        return "The PDF could not be made.", 500
     filename = f"{der.der_id}.pdf"
     return Response(
         pdf_bytes,

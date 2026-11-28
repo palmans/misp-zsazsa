@@ -13,7 +13,7 @@ import config as _cfg
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for, Response
 
 from webapp import audit, branding, misp_session, misp_store, notify_jobs, product_log
-from webapp.models import STAKEHOLDER_ROLES
+from webapp.models import STAKEHOLDER_ROLES, TLP_LEVELS
 from webapp.utils import TLP_NAMES, matching, md_to_html, ordered_counts, sort_products, tlp_counts, tlp_of
 from webapp.routes import data_collection
 from webapp.routes.source_event_utils import (
@@ -51,7 +51,9 @@ def _form_data(form, fia_id=""):
         "tlp": form.get("tlp", "amber"),
         "summary": form.get("summary", ""),
         "action_required": form.get("action_required", ""),
-        "what_happened": misp_store._split_lines(form.get("what_happened")),
+        # Markdown, kept line for line as written: blank lines and indents are
+        # its paragraphs and nested lists.
+        "what_happened": (form.get("what_happened") or "").strip().splitlines(),
         "source_description": form.get("source_description", ""),
         "source_reliability": form.get("source_reliability", ""),
         "information_credibility": form.get("information_credibility", ""),
@@ -91,7 +93,7 @@ def _wizard_context(fia=None, source_events=None):
     return {
         "fia": fia,
         "audiences": misp_store.FIA_AUDIENCES,
-        "tlp_levels": misp_store.FIA_TLP_LEVELS,
+        "tlp_levels": TLP_LEVELS,
         "reliabilities": misp_store.FIA_RELIABILITIES,
         "credibilities": misp_store.FIA_CREDIBILITIES,
         "review_states": misp_store.FIA_REVIEW_STATES,
@@ -610,7 +612,7 @@ def pdf(id):
         pdf_bytes = weasyprint.HTML(string=html).write_pdf()
     except Exception as exc:
         logger.warning("pdf: weasyprint failed for %s: %s", id, exc)
-        return f"PDF generation failed: {exc}", 500
+        return "The PDF could not be made.", 500
     filename = f"{fia.fia_id}.pdf"
     return Response(
         pdf_bytes,

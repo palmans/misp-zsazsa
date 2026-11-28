@@ -5,17 +5,18 @@ import os
 import secrets
 from pathlib import Path
 
-from flask import Flask, abort, g, redirect, request, session, jsonify, render_template
+from flask import Flask, abort, g, redirect, request, session, jsonify, render_template, url_for
 from markupsafe import Markup
 from pymisp.exceptions import PyMISPError
 from requests.exceptions import RequestException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import config
-from core import pymisp_compat, rulezet_lookup
+from core import indicators, pymisp_compat, rulezet_lookup
 from webapp import audit, misp_session, org_store, sso_users, collection_cache, indicator_meta_store
 from webapp.models import subscribed_products
-from webapp.utils import fill_product_tag_defaults, human_size, md_to_html, md_to_html_inline
+from webapp.utils import (bold_lead_labels, fill_product_tag_defaults, human_size, list_item_count, markdown_list,
+                          md_to_html, md_to_html_inline, md_to_text, nest_headings)
 from webapp.version import APP_VERSION
 
 
@@ -97,6 +98,17 @@ def create_app():
 
     app.jinja_env.globals["app_version"] = APP_VERSION
 
+    def _indicator_lookup_config():
+        """What _indicator_lookup.html hands the page: the patterns, the servers
+        an indicator can be looked up on and where to ask. Config only."""
+        from webapp import misp_store
+        return {**indicators.browser_config(),
+                "servers": [{"id": s["id"], "label": s["label"]} for s in misp_store.lookup_servers()],
+                "lookupUrl": url_for("api.indicator_lookup"), "cveUrl": url_for("api.cve_lookup")}
+
+    app.jinja_env.globals["indicator_lookup_config"] = _indicator_lookup_config
+    app.jinja_env.globals["indicator_kind"] = indicators.kind_of
+
     @app.context_processor
     def _inject_globals():
         return {
@@ -124,6 +136,26 @@ def create_app():
         """Render a multi-paragraph text field as block Markdown (used in PDFs and
         other server-rendered output where client-side Markdown is unavailable)."""
         return Markup(md_to_html(s)) if s else ""
+
+    @app.template_filter("bold_lead_labels")
+    def _bold_lead_labels(s):
+        return bold_lead_labels(s)
+
+    @app.template_filter("markdown_list")
+    def _markdown_list(lines):
+        return markdown_list(lines)
+
+    @app.template_filter("list_item_count")
+    def _list_item_count(lines):
+        return list_item_count(lines)
+
+    @app.template_filter("nest_headings")
+    def _nest_headings(s):
+        return nest_headings(s)
+
+    @app.template_filter("md_text")
+    def _md_text(s):
+        return md_to_text(s)
 
     @app.template_filter("slug")
     def _slug(s):

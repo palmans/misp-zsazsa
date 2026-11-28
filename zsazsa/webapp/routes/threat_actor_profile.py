@@ -13,8 +13,8 @@ import config
 from webapp import audit, branding, misp_session, misp_store, notify_jobs
 from webapp.rate_limit import rate_limited
 from webapp.diamond import render_diamond_png
-from webapp.models import STAKEHOLDER_ROLES
-from webapp.utils import TLP_NAMES, matching, ordered_counts, sort_products, tlp_counts, tlp_of
+from webapp.models import STAKEHOLDER_ROLES, TLP_LEVELS
+from webapp.utils import TLP_NAMES, matching, nest_headings, ordered_counts, sort_products, tlp_counts, tlp_of
 from notifier import dispatcher
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ def _form_context(tap=None):
     return {
         "tap": tap,
         "audiences": misp_store.FIA_AUDIENCES,
-        "tlp_levels": misp_store.FIA_TLP_LEVELS,
+        "tlp_levels": TLP_LEVELS,
         "reliabilities": misp_store.FIA_RELIABILITIES,
         "credibilities": misp_store.FIA_CREDIBILITIES,
         "threat_actor_items": misp_store.galaxy_threat_actors(),
@@ -217,7 +217,7 @@ def pdf(id):
         pdf_bytes = weasyprint.HTML(string=html).write_pdf()
     except Exception as exc:
         logger.warning("pdf: weasyprint failed for %s: %s", id, exc)
-        return f"PDF generation failed: {exc}", 500
+        return "The PDF could not be made.", 500
     return Response(
         pdf_bytes,
         mimetype="application/pdf",
@@ -476,7 +476,7 @@ def _markdown(tap, pir=None):
     lines += [f"**{label}:** {_one_line(value)}" for label, value in meta if _one_line(value)]
     lines.append("")
     if tap.summary:
-        lines += ["## Summary", "", tap.summary, ""]
+        lines += ["## Summary", "", nest_headings(tap.summary), ""]
 
     origin = get("suspected_origin")
     if origin and get("origin_confidence"):
@@ -496,10 +496,10 @@ def _markdown(tap, pir=None):
         for label, value in rows:
             lines += [f"**{label}:** {value}", ""]
         for label, value in blocks:
-            lines += [f"**{label}:**", "", value, ""]
+            lines += [f"**{label}:**", "", nest_headings(value), ""]
 
     if tap.attribution_rationale:
-        lines += ["## Attribution", "", tap.attribution_rationale, ""]
+        lines += ["## Attribution", "", nest_headings(tap.attribution_rationale), ""]
 
     scope = [(label, ", ".join(values)) for label, values in
              (("Geographic scope", get("geographic_scope", [])),
@@ -523,7 +523,7 @@ def _markdown(tap, pir=None):
     if written:
         lines += ["## Recommendations", ""]
         for label, value in written:
-            lines += [f"**{label}:**", "", value, ""]
+            lines += [f"**{label}:**", "", nest_headings(value), ""]
 
     references = [r for r in get("external_references", []) if r.strip()]
     if references:

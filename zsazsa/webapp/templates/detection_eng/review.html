@@ -296,15 +296,16 @@
                 <div class="col-lg-8">
                   <div class="mb-3">
                     <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Hypothesis</div>
-                    <div style="font-size:.88rem;">{{ (d.hypothesis or 'Not specified.') | md_inline }}</div>
+                    <div class="md-body" style="font-size:.88rem;">{{ (d.hypothesis or 'Not specified.') | md }}</div>
                   </div>
                   <div class="mb-3">
                     <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Log sources</div>
-                    {{ bullets(d.log_sources) }}
+                    {% if d.log_sources %}<div class="md-body" style="font-size:.82rem;">{{ d.log_sources | markdown_list | md }}</div>
+                    {% else %}<span class="text-muted" style="font-size:.82rem;">none recorded</span>{% endif %}
                   </div>
                   <div class="mb-3">
                     <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Expected rule output</div>
-                    <div style="font-size:.88rem;">{{ (d.expected_output or 'Not specified.') | md_inline }}</div>
+                    <div class="md-body" style="font-size:.88rem;">{{ (d.expected_output or 'Not specified.') | md }}</div>
                   </div>
                 </div>
                 <div class="col-lg-4">
@@ -403,34 +404,15 @@
 {% endblock %}
 
 {% block scripts %}
+{% include "_indicator_lookup.html" %}
+{% include "_preview_toggle_js.html" %}
 <script>
 (function() {
-  function setPreview(row, open) {
-    row.style.display = open ? '' : 'none';
-    document.querySelectorAll('[data-target="' + row.id + '"]').forEach(function(btn) {
-      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
-      if (btn.classList.contains('preview-toggle-btn')) {
-        var icon = btn.querySelector('i');
-        if (icon) icon.className = open ? 'fas fa-fw fa-eye-slash' : 'fas fa-fw fa-eye';
-      }
-    });
-  }
-
-  document.querySelectorAll('.preview-toggle-btn').forEach(function(btn) {
-    btn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      var targetId = btn.getAttribute('data-target');
-      var row = document.getElementById(targetId);
-      if (!row) return;
-      setPreview(row, row.style.display === 'none');
-    });
-  });
-
   document.querySelectorAll('.approval-open').forEach(function(btn) {
     btn.addEventListener('click', function() {
       var row = document.getElementById(btn.dataset.target);
       if (!row) return;
-      setPreview(row, true);
+      zsazsaSetPreview(row, true);
       row.scrollIntoView({behavior: 'smooth', block: 'center'});
     });
   });

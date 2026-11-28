@@ -233,7 +233,7 @@
                   {% if v.summary %}
                   <div class="mb-3">
                     <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Summary</div>
-                    <div class="report-md-body" data-md="{{ v.summary | e }}" style="font-size:.88rem;"></div>
+                    <div class="report-md-body md-body" data-md="{{ v.summary | e }}" style="font-size:.88rem;"></div>
                   </div>
                   {% endif %}
 
@@ -259,7 +259,7 @@
                   {% if v.immediate_actions %}
                   <div class="mb-3">
                     <div class="fw-semibold small text-uppercase text-muted mb-1" style="letter-spacing:.05em;">Recommended actions</div>
-                    {{ bullets(v.immediate_actions) }}
+                    <div class="md-body" style="font-size:.85rem;">{{ v.immediate_actions | join('\n') | md }}</div>
                     {% if v.patch_sla_internet or v.patch_sla_internal %}
                     <p class="mt-2 mb-0" style="font-size:.78rem;">
                       {% if v.patch_sla_internet %}<span class="pretext">Internet-facing SLA:</span> {{ v.patch_sla_internet | md_inline }}{% endif %}
@@ -348,33 +348,12 @@
 {% endblock %}
 
 {% block scripts %}
-{% include "_markdown_js.html" %}
+{% include "_indicator_lookup.html" %}
+{% include "_preview_toggle_js.html" %}
 {% include "_qa_review_js.html" %}
 {% include "_selection_js.html" %}
 <script>
 (function() {
-  document.querySelectorAll('.preview-toggle-btn').forEach(function(btn) {
-    btn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      var targetId = btn.getAttribute('data-target');
-      var row = document.getElementById(targetId);
-      if (!row) return;
-      var open = row.style.display !== 'none';
-      row.style.display = open ? 'none' : '';
-      btn.setAttribute('aria-expanded', open ? 'false' : 'true');
-      var icon = btn.querySelector('i');
-      if (icon) {
-        icon.className = 'fas fa-fw ' + (open ? btn.dataset.previewIcon : 'fa-eye-slash');
-      }
-      if (!open) {
-        row.querySelectorAll('.report-md-body[data-md]').forEach(function(el) {
-          zsazsaRenderMarkdown(el, el.getAttribute('data-md'));
-          el.removeAttribute('data-md');
-        });
-      }
-    });
-  });
-
   // Feedback modal wiring
   var feedbackModal = document.getElementById('feedback-modal');
   if (feedbackModal) {
