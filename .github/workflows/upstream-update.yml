@@ -1,0 +1,60 @@
+# Refreshes misp-docker/, misp-scraper/ and zsazsa/ from upstream with
+# scripts/update-upstream.sh and opens (or updates) one pull request with the
+# changes. Nothing happens when upstream has not changed.
+#
+# Needs: Settings → Actions → General → Workflow permissions →
+# "Allow GitHub Actions to create and approve pull requests".
+name: Upstream update
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Update upstream folders
+        env:
+          UPSTREAM_FAILED_PATCHES: ${{ runner.temp }}/failed-patches
+        run: bash scripts/update-upstream.sh
+
+      - name: Describe the changes
+        id: describe
+        env:
+          FAILED: ${{ runner.temp }}/failed-patches
+          BODY: ${{ runner.temp }}/pr-body.md
+        run: |
+          bash .github/scripts/upstream-pr.sh body "$FAILED" > "$BODY"
+          title=$(bash .github/scripts/upstream-pr.sh title "$FAILED")
+          labels=upstream
+          [[ -s "$FAILED" ]] && labels+=$'\n'patch-failed
+          {
+            echo "title=$title"
+            echo "labels<<EOF"
+            echo "$labels"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          cat "$BODY" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update the pull request
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          branch: upstream/update
+          delete-branch: true
+          title: ${{ steps.describe.outputs.title }}
+          commit-message: ${{ steps.describe.outputs.title }}
+          body-path: ${{ runner.temp }}/pr-body.md
+          labels: ${{ steps.describe.outputs.labels }}

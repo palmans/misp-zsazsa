@@ -1,0 +1,8 @@
+# Keeps the actions of .github/workflows/ up to date. The upstream folders are
+# updated by the "Upstream update" workflow, not by Dependabot.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

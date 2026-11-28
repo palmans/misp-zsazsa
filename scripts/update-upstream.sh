@@ -81,6 +81,14 @@ changes belong in \`deploy/\`.
 $ROWS
 EOF
 
+# For the GitHub workflow: the patches that did not apply, one per line.
+if [[ -n "${UPSTREAM_FAILED_PATCHES:-}" ]]; then
+    : > "$UPSTREAM_FAILED_PATCHES"
+    if (( ${#FAILED[@]} )); then
+        printf '%s\n' "${FAILED[@]}" > "$UPSTREAM_FAILED_PATCHES"
+    fi
+fi
+
 if (( ${#FAILED[@]} )); then
     echo
     echo "These patches did not apply; upstream changed the code or fixed it itself:" >&2
