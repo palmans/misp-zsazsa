@@ -63,6 +63,9 @@ zsazsa/prompts/
 # zsazsa in Docker: configuration (API keys), data, prompts, misp-scraper config
 zsazsa/docker/volumes/
 
+# --- Logs of a failed tests/e2e.sh run ---
+/e2e-logs/
+
 # --- Editor / OS / tooling ---
 .vscode/
 .idea/

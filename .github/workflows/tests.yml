@@ -1,0 +1,109 @@
+# Checks that this deployment still works: tests/check.sh (quick, without
+# Docker) and tests/e2e.sh (installs and checks both stacks on the runner),
+# once as a fresh installation and once as an update from the base branch.
+#
+# Runs on pull requests and pushes to main, and is called by the "Upstream
+# update" workflow for its pull request: a pull request that a workflow opens
+# with GITHUB_TOKEN starts no pull_request workflows itself. By hand: Actions →
+# Tests → Run workflow, with the branch to test (e.g. upstream/update).
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Also test the update from this branch or commit (empty for none)
+        default: main
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to test
+        type: string
+        required: true
+      base:
+        description: Also test the update from this commit (empty for none)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: tests/check.sh
+        run: bash tests/check.sh
+
+  e2e:
+    name: e2e (${{ matrix.mode }})
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [install, update]
+    steps:
+      - name: What to test
+        id: plan
+        env:
+          MODE: ${{ matrix.mode }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base }}
+        run: |
+          if [[ "$MODE" == update && -z "$BASE" ]]; then
+            echo "No base to update from: skipped." >> "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.plan.outputs.skip != 'true'
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Fetch the base
+        if: matrix.mode == 'update' && steps.plan.outputs.skip != 'true'
+        env:
+          BASE: ${{ steps.plan.outputs.base }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE"
+          echo "BASE_SHA=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"
+
+      - name: tests/e2e.sh
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          MODE: ${{ matrix.mode }}
+          E2E_LOGS: ${{ runner.temp }}/e2e-logs
+        run: |
+          args=()
+          [[ "$MODE" == update ]] && args+=(--upgrade-from "$BASE_SHA")
+          sudo --preserve-env=CI,GITHUB_ACTIONS,GITHUB_STEP_SUMMARY,E2E_LOGS bash tests/e2e.sh "${args[@]}"
+
+      # Container logs and scripts/report.sh's report, written by e2e.sh on failure.
+      - name: Logs
+        if: failure()
+        env:
+          E2E_LOGS: ${{ runner.temp }}/e2e-logs
+        run: |
+          for f in "$E2E_LOGS"/*; do
+            [[ -f "$f" ]] || continue
+            echo "::group::$(basename "$f")"
+            cat "$f"
+            echo "::endgroup::"
+          done

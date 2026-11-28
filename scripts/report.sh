@@ -100,7 +100,8 @@ mask() {
         "$ROOT/zsazsa/docker/volumes/config/__init__.py" 2>&1
 
     section "zsazsa reaches MISP through the reverse proxy"
-    ZSAZSA exec -T webapp python -c "import config, urllib.request; r = urllib.request.urlopen(config.MISP_WEBAPP_URL + '/users/login', timeout=10); print(config.MISP_WEBAPP_URL, r.status)" 2>&1 | tail -3
+    # Verifies the certificate as zsazsa does (MISP_WEBAPP_VERIFYCERT, from PROXY_CERT_VALID).
+    ZSAZSA exec -T webapp python -c "import config, ssl, urllib.request; c = None if config.MISP_WEBAPP_VERIFYCERT else ssl._create_unverified_context(); r = urllib.request.urlopen(config.MISP_WEBAPP_URL + '/users/login', timeout=10, context=c); print(config.MISP_WEBAPP_URL, r.status)" 2>&1 | tail -3
 
     # The last 2 hours only, without zsazsa's PyMISP version warning on every call.
     section "zsazsa and misp-scraper logs (last 2 hours)"

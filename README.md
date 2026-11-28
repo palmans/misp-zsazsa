@@ -21,6 +21,7 @@ The three folders `misp-docker/`, `misp-scraper/` and `zsazsa/` are copies of th
 - [First run](#first-run)
 - [Day-to-day operations](#day-to-day-operations)
 - [Updating](#updating)
+- [Tests](#tests)
 - [Backup and restore](#backup-and-restore)
 - [Troubleshooting](#troubleshooting)
 - [Security notes and recommendations](#security-notes-and-recommendations)
@@ -74,7 +75,10 @@ The three folders `misp-docker/`, `misp-scraper/` and `zsazsa/` are copies of th
 | `deploy/reverse-proxy.example.conf` | Example configuration for a plain nginx reverse proxy | yes |
 | `scripts/init.sh` | Generates all configuration, passwords, keys and the certificate from `deploy/settings.env` | yes |
 | `scripts/update-upstream.sh` | Refreshes the three upstream folders and applies `deploy/patches/` | yes |
-| `.github/workflows/upstream-update.yml` | Runs `update-upstream.sh` every Monday and opens a pull request with the upstream changes | yes |
+| `scripts/update.sh` | Updates the Docker host to the repository: `git pull`, `init.sh`, both stacks, prompt check | yes |
+| `.github/workflows/upstream-update.yml` | Runs `update-upstream.sh` every Monday, opens a pull request with the upstream changes and runs the tests on it | yes |
+| `tests/check.sh`, `tests/e2e.sh` | Tests that the deployment still works with the upstream folders (see [Tests](#tests)) | yes |
+| `.github/workflows/tests.yml` | Runs the tests on pull requests, on pushes to `main` and for the upstream update | yes |
 | `misp-docker/.env`, `misp-docker/ssl/` | Generated MISP configuration, passwords and certificate | no |
 | `misp-docker/{configs,files,gnupg,logs}/` | MISP runtime data (created by the containers) | no |
 | `zsazsa/docker/.env` | Generated zsazsa compose settings | no |
@@ -275,9 +279,18 @@ The stacks show up in Portainer as stacks created outside Portainer ("limited" c
 
 ## Updating
 
-The *Upstream update* workflow (`.github/workflows/upstream-update.yml`) runs `scripts/update-upstream.sh` on GitHub every Monday, and on demand under *Actions → Upstream update → Run workflow*. When upstream changed, it opens or updates one pull request on the branch `upstream/update`, with links to the upstream commits, the new MISP image versions, the lines added to zsazsa's CHANGELOG and the patches that no longer apply (label `patch-failed`). Review and merge it, then run the steps below from `git pull` on: skip `update-upstream.sh`, the pull request already did that. It needs *Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests*.
+The *Upstream update* workflow (`.github/workflows/upstream-update.yml`) runs `scripts/update-upstream.sh` on GitHub every Monday, and on demand under *Actions → Upstream update → Run workflow*. When upstream changed, it opens or updates one pull request on the branch `upstream/update`, with links to the upstream commits, the new MISP image versions, the lines added to zsazsa's CHANGELOG and the patches that no longer apply (label `patch-failed`). It then runs the [tests](#tests) on that branch and reports the result on the pull request as the status *Upstream update / tests* (and in a comment when they fail). The workflow needs *Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests*.
 
-By hand:
+Review and merge it once that status is green, then update the Docker host:
+
+```bash
+cd /opt/misp-zsazsa
+sudo bash scripts/update.sh
+```
+
+`update.sh` shows the incoming commits, new MISP image versions and the lines added to zsazsa's CHANGELOG, asks before it changes anything, and then does the steps below from `git pull` on (fast-forward only; it refuses when files git tracks were changed on the host): `init.sh`, `docker compose pull` and `up` for MISP, `build --pull` and `up` for zsazsa and misp-scraper (each until healthy), and lists the prompts that differ (`sync-prompts.sh`). What stays manual it prints at the end: the "Upgrading" notes, prompts to take over, migrations. Running it again is safe. `--yes` skips the question, `--skip-git` leaves the checkout as it is (after running `update-upstream.sh` yourself), `--no-image-pull` uses the images on the host.
+
+By hand (without the pull request, or without `update.sh`):
 
 ```bash
 cd /opt/misp-zsazsa
@@ -300,6 +313,27 @@ Then:
 Read the upstream release notes before updating MISP across minor versions.
 
 The MISP images are pinned to the version in `misp-docker/template.env` (`CORE_RUNNING_TAG`, `MODULES_RUNNING_TAG`), so a `docker compose pull` alone never upgrades MISP unexpectedly. Avoid automatic updaters such as Watchtower for MISP.
+
+## Tests
+
+Upstream can change what this deployment relies on: a renamed setting, service or mount point, a patch that no longer applies, a MISP image that is not published (yet). Two scripts check that, and the *Tests* workflow (`.github/workflows/tests.yml`) runs them on GitHub for every pull request, for every push to `main`, and for the pull request of the *Upstream update* workflow (which calls it: a pull request a workflow opens starts no other workflows by itself).
+
+| Script | What it checks | Needs | Time |
+|---|---|---|---|
+| `tests/check.sh` | Our scripts (syntax, ShellCheck, file modes); the patches of `deploy/patches/` are in the upstream folders; what `deploy/` and `scripts/` rely on in upstream (settings, services, mount points, nginx and misp-core entrypoints, uid 1000); `scripts/lib.sh`; `scripts/init.sh` run twice in a copy (the configuration it writes, nothing appended that upstream renamed, nothing changed on the second run); the Compose configuration of both stacks with the overrides; the PR text of the update workflow; that the pinned images exist; `scripts/update-upstream.sh` keeps the runtime files | bash, git, python3, openssl, the docker CLI (no daemon) | 1–2 min |
+| `tests/e2e.sh` | Installs everything on the Docker host as in [Installation](#installation), in a copy of the repository, with a reverse proxy made from `deploy/reverse-proxy.example.conf` on a stand-in LAN, runs `post-install.sh` and checks it the way it is used: MISP through the proxy and on `MISP_LAN_IP`, `/zsazsa/`, the way back to zsazsa after a MISP login, single sign-on, zsazsa and misp-scraper calling MISP with their own (address-limited) keys, misp-scraper listening on Redis, what `customize_misp.sh` sets, `sync-prompts.sh`, `report.sh` (secrets masked), the database backup, no restarting containers, and a clean checkout afterwards (no file git tracks changed, so `git pull` keeps working; everything the deployment wrote in `.gitignore`). With `--upgrade-from <ref>` it installs that version first, then updates with `scripts/update.sh` as in [Updating](#updating) (its `git pull` included), and checks it all again and that MISP's data survived. What fails on the version before the update is reported as a warning only: that version is what is merged already, and a pull request may be the fix | root, Docker, ~6 GB RAM | 20–40 min |
+
+On GitHub, `e2e (install)` installs the pull request as a new deployment and `e2e (update)` updates its base branch to it. A failed run lists what failed in the job summary, and prints the container logs and the report of `report.sh` in the *Logs* step. By hand: *Actions → Tests → Run workflow* with the branch to test, for example `upstream/update`.
+
+Locally:
+
+```bash
+bash tests/check.sh                              # anywhere; CHECK_OFFLINE=1 skips what needs the internet
+sudo bash tests/e2e.sh                           # on a spare Docker host or VM
+sudo bash tests/e2e.sh --upgrade-from main --keep
+```
+
+`tests/e2e.sh` uses the names of a real deployment (Compose projects `misp-docker` and `zsazsa`, network `cti-lan`) and refuses to run where they exist: never run it on the Docker host of the deployment itself.
 
 ## Backup and restore
 
@@ -374,7 +408,7 @@ cd misp-docker && docker compose exec misp-nginx nginx -T | grep -A12 'zsazsa CT
 docker compose exec redis sh -c 'valkey-cli -a "$REDIS_PASSWORD" --no-auth-warning ping'
 
 # zsazsa reaches MISP through the reverse proxy
-cd zsazsa/docker && docker compose exec webapp python -c "import config, urllib.request; print(urllib.request.urlopen(config.MISP_WEBAPP_URL + '/users/login').status)"
+cd zsazsa/docker && docker compose exec webapp python -c "import config, ssl, urllib.request; c = None if config.MISP_WEBAPP_VERIFYCERT else ssl._create_unverified_context(); print(urllib.request.urlopen(config.MISP_WEBAPP_URL + '/users/login', context=c).status)"
 ```
 
 ### misp-nginx does not start

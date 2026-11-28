@@ -61,7 +61,7 @@ for component in "${COMPONENTS[@]}"; do
             mv "$STASH/$dir/$path" "$ROOT/$dir/$path"
         fi
     done
-    rm -rf "$STASH/$dir"
+    rm -rf "${STASH:?}/$dir"
 
     ROWS+="| \`$dir/\` | ${repo%.git} | \`${sha:0:12}\` | $date |"$'\n'
     echo "    ${sha:0:12} ($date)"
