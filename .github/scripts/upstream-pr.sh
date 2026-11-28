@@ -95,11 +95,10 @@ cat << 'EOF'
 ## After merging, on the Docker host
 
 ```bash
-cd /opt/misp-zsazsa && git pull
-bash scripts/init.sh                # applies the new MISP image tags to misp-docker/.env
-cd misp-docker      && docker compose pull && docker compose up -d
-cd ../zsazsa/docker && docker compose build --pull && docker compose up -d
+cd /opt/misp-zsazsa && sudo bash scripts/update.sh
 ```
+
+It shows what comes in and asks first, then pulls, runs `init.sh` (new MISP image tags), pulls and starts MISP, builds and starts zsazsa and misp-scraper, and lists the prompts that differ. See *Updating* in `README.md` for the steps by hand.
 
 - [ ] Read the "Upgrading" notes in `zsazsa/CHANGELOG.md`
 - [ ] Take changed prompts: `bash scripts/sync-prompts.sh [--apply <prompt.md> ...]`

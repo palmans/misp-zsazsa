@@ -61,6 +61,8 @@ step() {
     printf '\n%s[%s] %s%s\n' "$B" "$(date +%T)" "$*" "$OFF"
 }
 g() { git -c safe.directory='*' -C "$REPO" "$@"; }
+sgit() { git -c safe.directory='*' -C "$SANDBOX" "$@"; }
+E2E_BRANCH=misp-zsazsa-e2e
 
 # --- Test values ---------------------------------------------------------------
 
@@ -119,6 +121,7 @@ cleanup() {
         if [[ -n "$SANDBOX" ]]; then
             g worktree remove --force "$SANDBOX" > /dev/null 2>&1
             g worktree prune
+            g branch -q -D "$E2E_BRANCH-deployed" "$E2E_BRANCH-target" > /dev/null 2>&1
         fi
         [[ -n "$WORK" ]] && rm -rf "$WORK"
     fi
@@ -396,9 +399,9 @@ PY
     # git tracks alone (or the next "git pull" fails), and be in .gitignore
     # (or it shows up to be committed, secrets included).
     section "$phase: the checkout"
-    out=$(git -c safe.directory='*' -C "$SANDBOX" status --porcelain --untracked-files=no 2>&1)
+    out=$(sgit status --porcelain --untracked-files=no 2>&1)
     expect_eq "no file git tracks changed (git pull keeps working)" "" "$out"
-    out=$(git -c safe.directory='*' -C "$SANDBOX" status --porcelain --untracked-files=all 2>&1 | grep '^??')
+    out=$(sgit status --porcelain --untracked-files=all 2>&1 | grep '^??')
     expect_eq "every file the deployment wrote is in .gitignore" "" "$out"
 }
 
@@ -414,10 +417,32 @@ if [[ -n "$UPGRADE_FROM" ]]; then
     EVENT=$(misp_api /events/add -d '{"Event": {"info": "e2e: made before the update", "distribution": 0}}' |
         python3 -c 'import json, sys; print(json.load(sys.stdin)["Event"]["id"])' 2>&1)
     expect_match "MISP event made before the update" '^[0-9]+$' "$EVENT"
-    # README.md, "Updating": git pull, then init.sh and both stacks.
-    git -c safe.directory='*' -C "$SANDBOX" checkout -q --detach "$TARGET" || die "git checkout $TARGET"
-    check "init.sh" bash "$SANDBOX/scripts/init.sh"
-    start_stacks
+    # README.md, "Updating": scripts/update.sh. Its git pull comes from a branch
+    # at the commit under test, which the deployed copy follows.
+    update=(--yes)
+    (( PULL )) || update+=(--no-image-pull)
+    if g merge-base --is-ancestor "$FIRST" "$TARGET"; then
+        g branch -f "$E2E_BRANCH-target" "$TARGET" > /dev/null &&
+            sgit checkout -q -b "$E2E_BRANCH-deployed" &&
+            sgit branch -q --set-upstream-to="$E2E_BRANCH-target" || die "git branches for the update"
+        if [[ ! -f "$SANDBOX/scripts/update.sh" ]]; then
+            # A version without update.sh: git pull by hand, then the new update.sh.
+            info "$(g rev-parse --short "$FIRST") has no scripts/update.sh: git pull, then update.sh --skip-git"
+            sgit merge -q --ff-only "$E2E_BRANCH-target" || die "git pull"
+            update+=(--skip-git)
+        fi
+    else
+        info "$(g rev-parse --short "$TARGET") does not fast-forward from $(g rev-parse --short "$FIRST"): git checkout, then update.sh --skip-git"
+        sgit checkout -q --detach "$TARGET" || die "git checkout $TARGET"
+        update+=(--skip-git)
+    fi
+    if out=$(bash "$SANDBOX/scripts/update.sh" "${update[@]}" 2>&1); then
+        pass "scripts/update.sh ${update[*]}"
+    else
+        fail "scripts/update.sh ${update[*]}" "$(tail -n 40 <<< "$out")"
+    fi
+    printf '%s\n' "$out" | grep -vE '^ +(Container|Image|#[0-9])' | sed 's/^/       /'
+    expect_eq "update.sh brought the checkout to the commit under test" "$(g rev-parse "$TARGET")" "$(sgit rev-parse HEAD)"
     verify "$(g rev-parse --short "$TARGET") (after the update)"
     section "after the update: data"
     out=$(misp_api "/events/view/$EVENT" | python3 -c 'import json, sys; print(json.load(sys.stdin)["Event"]["info"])' 2>&1)
