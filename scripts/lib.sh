@@ -1,6 +1,4 @@
 # Shared by the scripts in this folder; sourced, not run.
-# The variables are used by the scripts that source this file.
-# shellcheck shell=bash disable=SC2034
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SETTINGS="$ROOT/deploy/settings.env"

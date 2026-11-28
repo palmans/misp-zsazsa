@@ -52,7 +52,14 @@ case "${PROXY_CERT_VALID:-true}" in
     *) VERIFYCERT=False ;;
 esac
 
-chmod +x "$ROOT/deploy/nginx/05-zsazsa.sh" "$ROOT/deploy/misp/customize_misp.sh" "$ROOT"/scripts/*.sh
+# The modes git has: another mode counts as a local change, and "git pull" then
+# fails on a commit that changes the file. lib.sh is only sourced (init.sh made
+# it executable before).
+chmod +x "$ROOT/deploy/nginx/05-zsazsa.sh" "$ROOT/deploy/misp/customize_misp.sh"
+for script in "$ROOT"/scripts/*.sh; do
+    [[ "$script" == */lib.sh ]] || chmod +x "$script"
+done
+chmod -x "$ROOT/scripts/lib.sh"
 
 # --- misp-docker -------------------------------------------------------------
 
