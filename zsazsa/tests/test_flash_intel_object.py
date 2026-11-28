@@ -90,7 +90,7 @@ class Alert(unittest.TestCase):
         self.assertEqual(self.make(), "FIA-00042")
         self.assertEqual(self.created["summary"], "Ransomware stopped a grid operator.")
         self.assertEqual(self.created["actions_immediate"], ["Patch the VPN"])
-        self.assertEqual(self.created["what_happened"], ["The operator's VPN was breached."])
+        self.assertEqual(self.created["what_happened"], ["- The operator's VPN was breached."])
         self.assertEqual(self.created["review_state"], misp_store.FIA_REVIEW_DRAFT)
         self.assertEqual(self.created["author"], "analyser")
 
@@ -178,8 +178,8 @@ class StoredAlert(unittest.TestCase):
              mock.patch.object(misp_store, "_zsazsa_event", return_value=event), \
              mock.patch.object(misp_store, "_sync_object_attributes") as synced, \
              mock.patch.object(misp_store, "_sync_tlp_tag"), \
-             mock.patch.object(misp_store, "_delete_fia_reports"), \
-             mock.patch.object(misp_store, "_write_fia_report"), \
+             mock.patch.object(misp_store, "_delete_product_reports"), \
+             mock.patch.object(misp_store, "_write_product_report"), \
              mock.patch.object(misp_store, "_retag_product_sources"), \
              mock.patch.object(misp_store.misp_session, "current_user_email", return_value="a@example.org"):
             misp_store.update_fia("u" * 36, {"title": "Alert, edited"})

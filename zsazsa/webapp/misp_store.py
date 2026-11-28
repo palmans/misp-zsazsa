@@ -38,9 +38,9 @@ from analyser import event_state, tagger
 from core.db import next_sequence_value
 from pymisp import MISPAttribute, MISPEvent, MISPObject, PyMISP
 from webapp import misp_session
-from webapp.collection_cache import AI_SUMMARY_PREFIX, source_slug
-from webapp.models import STAKEHOLDER_ROLES
-from webapp.utils import PRODUCT_TAG_PREFIX, human_size, ordered_counts, scraper_enabled
+from webapp.collection_cache import AI_SUMMARY_PREFIX, LOOKUP_REPORT_PREFIX, event_tlp, source_slug
+from webapp.models import STAKEHOLDER_ROLES, TLP_LEVELS
+from webapp.utils import PRODUCT_TAG_PREFIX, human_size, markdown_list, nest_headings, ordered_counts, scraper_enabled
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
@@ -1057,7 +1057,7 @@ def _published_at(event):
             return None
         if epoch <= 0:
             return None
-        dt = datetime.utcfromtimestamp(epoch)
+        dt = datetime.fromtimestamp(epoch, timezone.utc)
     if dt.year <= 1971:
         return None
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
@@ -2454,10 +2454,6 @@ def _indicator_feed_ns(event):
     )
 
 
-def next_indicator_feed_id():
-    return _next_id(config.TAG_INDICATOR_FEED, "FEED")
-
-
 def list_indicator_feeds():
     misp = _misp()
     events = _search_all(misp, tags=[config.TAG_INDICATOR_FEED], pythonify=True)
@@ -2874,18 +2870,9 @@ def _feed_client(s):
     return cache[key]
 
 
-def indicator_stat_servers():
-    """The server configs the pipeline counts indicators on: zsazsa's own store,
-    the scraper and every enabled collection-source server, each once.
-
-    Once by URL, as the scraper is often the store itself, and counting one
-    server twice doubles its numbers. A server without an API key is left out.
-    """
-    configs = [s for s in [_webapp_store_server()] if s]
-    if scraper_enabled():
-        configs.append({"id": "scraper", "label": "MISP scraper", "url": config.MISP_URL,
-                        "api_key": config.MISP_KEY, "verify_tls": config.MISP_VERIFYCERT})
-    configs += [s for s in getattr(config, "MISP_SERVERS", []) or [] if s.get("enabled", True)]
+def _distinct_servers(configs):
+    """The usable server configs, each URL once: the scraper is often the store
+    itself, and asking one server twice doubles what it answers."""
     servers, seen = [], set()
     for s in configs:
         url = (s.get("url") or "").rstrip("/")
@@ -2893,6 +2880,22 @@ def indicator_stat_servers():
             seen.add(url)
             servers.append(s)
     return servers
+
+
+def _collection_servers():
+    """The scraper and every enabled collection-source server, as server configs."""
+    configs = []
+    if scraper_enabled():
+        configs.append({"id": "scraper", "label": "MISP scraper", "url": config.MISP_URL,
+                        "api_key": config.MISP_KEY, "verify_tls": config.MISP_VERIFYCERT})
+    return configs + [s for s in getattr(config, "MISP_SERVERS", []) or [] if s.get("enabled", True)]
+
+
+def indicator_stat_servers():
+    """The server configs the pipeline counts indicators on: zsazsa's own store,
+    the scraper and every enabled collection-source server, each once. A server
+    without an API key is left out."""
+    return _distinct_servers([s for s in [_webapp_store_server()] if s] + _collection_servers())
 
 
 def indicator_feed_servers():
@@ -3127,6 +3130,8 @@ def _indicator_search_kwargs(filters):
         "include_context": True,
         "limit": indicator_limit(filters),
     }
+    if filters.get("value"):
+        kwargs["value"] = filters["value"]
     if filters.get("types"):
         kwargs["type_attribute"] = list(filters["types"])
     if filters.get("to_ids") in ("yes", "no"):
@@ -3188,7 +3193,7 @@ def _indicator_search_kwargs(filters):
 
 
 # The order the search arguments are written out in, for the card and the script.
-_PYMISP_ARG_ORDER = ["controller", "type_attribute", "to_ids", "published", "enforce_warninglist",
+_PYMISP_ARG_ORDER = ["controller", "value", "type_attribute", "to_ids", "published", "enforce_warninglist",
                      "org", "tags", "eventid", "timestamp", "date_from", "date_to",
                      "limit", "include_context", "pythonify"]
 
@@ -3328,7 +3333,8 @@ def _parse_attribute_rows(raw, server_id, server_label, server_url, filters):
         ts = a.get("timestamp")
         try:
             ts_epoch = int(ts) if ts else 0
-            ts_display = datetime.utcfromtimestamp(ts_epoch).strftime("%Y-%m-%d %H:%M") if ts_epoch else ""
+            ts_display = (datetime.fromtimestamp(ts_epoch, timezone.utc).strftime("%Y-%m-%d %H:%M")
+                          if ts_epoch else "")
         except (TypeError, ValueError):
             ts_epoch, ts_display = 0, ""
         event_id = a.get("event_id") or event.get("id", "")
@@ -3567,6 +3573,119 @@ def search_indicators(filters, server_ids=None, limit=None):
         raise RuntimeError(reason)
     rows.sort(key=lambda r: r["_ts"], reverse=True)
     return rows
+
+
+# An indicator lookup from a report answers with at most this many attributes.
+LOOKUP_LIMIT = 50
+
+
+def lookup_servers():
+    """The servers an indicator in a report can be looked up on, as id, label
+    and url: the scraper and every enabled MISP server of the data collection,
+    each once. Not zsazsa's own store. Config only, no request."""
+    return [{"id": _server_id(s), "label": s.get("label") or s["url"], "url": s["url"].rstrip("/")}
+            for s in _distinct_servers(_collection_servers())]
+
+
+def lookup_server_label(server):
+    """How a lookup names where it looked: a server's label, "every server" for
+    "all", or None for a server it cannot look on."""
+    if server == "all":
+        return "every server"
+    return next((s["label"] for s in lookup_servers() if s["id"] == server), None)
+
+
+def lookup_indicator(value, server="all"):
+    """The to_ids attributes of published events that hold this value, on one
+    server, by its id, or on "all".
+
+    Returns (rows, more, failures): the indicator feed's rows, newest first and
+    at most LOOKUP_LIMIT, each linking to the event on the server it came from;
+    whether a server had more; and the servers that did not answer. zsazsa's own
+    records are left out, as in a feed. When no server answers it raises.
+    """
+    servers = [s for s in _distinct_servers(_collection_servers()) if server in ("all", _server_id(s))]
+    if not servers:
+        raise RuntimeError("no MISP server to look it up on")
+    kwargs = _indicator_search_kwargs({"value": value, "to_ids": "yes", "published": "yes", "limit": LOOKUP_LIMIT})
+    rows, failures, more, seen = [], [], False, set()
+    for s in servers:
+        sid, label = _server_id(s), s.get("label") or s["url"]
+        try:
+            attrs = _attributes_from(_feed_client(s).search(**kwargs))
+        except Exception as exc:
+            logger.warning("Indicator lookup failed on server %r: %s", sid, exc)
+            failures.append(f"{label} {_server_failure(exc)}")
+            continue
+        more = more or len(attrs) >= LOOKUP_LIMIT
+        # The same event synced to two servers is one answer, from the first.
+        for row in _parse_attribute_rows(attrs, sid, label, s["url"].rstrip("/"), {}):
+            key = (row["event_uuid"], row["type"], row["value"])
+            if key not in seen:
+                seen.add(key)
+                # What a product's text it goes into has to be cleared for.
+                row["tlp"] = event_tlp(row["tags"])
+                # Without a tag it counts as amber, and the page says it has none.
+                row["tlp_tagged"] = any(t.lower().startswith("tlp:") for t in row["tags"])
+                rows.append(row)
+    if len(failures) == len(servers):
+        raise RuntimeError("; ".join(failures))
+    rows.sort(key=lambda r: r["_ts"], reverse=True)
+    return rows[:LOOKUP_LIMIT], more or len(rows) > LOOKUP_LIMIT, failures
+
+
+def _md_cell(text) -> str:
+    """Text from MISP for a Markdown table cell: on one line, and nothing in it
+    read as Markdown or HTML where the report is shown."""
+    return re.sub(r"([\\`*_{}\[\]()<>#!|~])", r"\\\1", " ".join(str(text or "").split()))
+
+
+def lookup_report_content(value, where, rows, more, failures=(), heading=True) -> str:
+    """The Markdown of a lookup: what was asked, where and when, the servers
+    that did not answer, and the answer as the page showed it. As a report
+    added to an event it has a heading; put into a product's text it has not."""
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    asked = f"Looked up on {_md_cell(where)} on {when}, in published events, attributes with to_ids set."
+    lines = ([f"# Lookup of {_md_cell(value)}", "", asked, ""] if heading
+             else [f"**Lookup of {_md_cell(value)}.** {asked}", ""])
+    lines += [f"{_md_cell(f)}, so it is not in this answer." for f in failures] + ([""] if failures else [])
+    if not rows:
+        return "\n".join(lines + ["Nothing found."]) + "\n"
+    lines += ["| Event ID | Event title | Creator org | Value | Event date | Attribute timestamp | Type | Server |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for r in rows:
+        event = _md_cell(r["event_id"])
+        if r["event_url"].startswith(("https://", "http://")):
+            event = f"[{event}]({r['event_url']})"
+        lines.append("| " + " | ".join([event] + [_md_cell(r[f]) for f in (
+            "event_title", "creator_org", "value", "event_date", "attribute_timestamp", "type", "server_label")]) + " |")
+    if more:
+        lines += ["", f"The answer stops at {LOOKUP_LIMIT} attributes; there are more."]
+    return "\n".join(lines) + "\n"
+
+
+def cve_report_content(cve_id, info, heading=True) -> str:
+    """The Markdown of a CVE lookup at Vulnerability-Lookup, as a report added to
+    an event (with a heading) or put into a product's text (without)."""
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    facts = [("CVSS", " ".join(x for x in (info.get("cvss_score"), info.get("cvss_severity")) if x)),
+             ("CVSS vector", info.get("cvss_vector")), ("CISA KEV", info.get("cisa_kev")),
+             ("Exploit", info.get("exploit_availability")),
+             ("Affected", ", ".join(info.get("products") or [])), ("Versions", ", ".join(info.get("versions") or [])),
+             ("Weakness", ", ".join(info.get("cwes") or []))]
+    asked = f"Looked up at Vulnerability-Lookup (vulnerability.circl.lu) on {when}."
+    lines = [f"# {cve_id}", "", asked, ""] if heading else [f"**{cve_id}.** {asked}", ""]
+    if not info:
+        return "\n".join(lines + ["Vulnerability-Lookup does not have it."]) + "\n"
+    if info.get("title"):
+        lines += [_md_cell(info["title"]), ""]
+    if info.get("description"):
+        lines += [_md_cell(info["description"]), ""]
+    lines += [f"- **{name}:** {_md_cell(text)}" for name, text in facts if text]
+    refs = [u for u in info.get("references") or [] if str(u).startswith(("https://", "http://"))]
+    if refs:
+        lines += ["", "References:", ""] + [f"- <{u}>" for u in refs if not any(c in u for c in "<> ")]
+    return "\n".join(lines) + "\n"
 
 
 def count_indicators(filters, server_ids=None, cap=100000):
@@ -3857,17 +3976,25 @@ def products_for_stakeholder(stakeholder, pirs, girs, limit=20):
     distribution of. A product is listed when it answers one of those PIRs, or
     its title or a tag names one of them, or when it is an approved alert or
     advisory, or a published briefing, of a type the stakeholder subscribes to.
+    Only products last changed on or after the day the stakeholder was created
+    are listed, so a new stakeholder does not start with the products from
+    before them.
     """
     needles = {p.pir_id for p in pirs} | {g.gir_id for g in girs} | {r.uuid for r in pirs + girs}
     needles.discard("")
+    subscribed_products = set(stakeholder.products)
     events = []
-    if needles:
+    if needles or subscribed_products:
+        filters = {}
+        if stakeholder.created_at:
+            filters["timestamp"] = int(stakeholder.created_at.replace(tzinfo=timezone.utc).timestamp())
         try:
-            events = _search_all(_misp(), tags=['zsazsa:ctiproduct="%"'], metadata=False, pythonify=True)
+            events = _search_all(_misp(), tags=['zsazsa:ctiproduct="%"'], metadata=False, pythonify=True, **filters)
         except Exception as exc:
             logger.warning("products_for_stakeholder MISP search failed: %s", exc)
         if isinstance(events, dict):
             events = []
+    changed_since = {ev.uuid for ev in events}
 
     matches = []
     for ev in events:
@@ -3887,9 +4014,8 @@ def products_for_stakeholder(stakeholder, pirs, girs, limit=20):
                 product_type=ptype,
                 misp_url=f"{config.MISP_WEBAPP_URL}/events/view/{ev.uuid}",
             ))
-    # Include directly delivered products for subscribed product types.
-    subscribed_products = set(stakeholder.products)
 
+    # Include directly delivered products for subscribed product types.
     if "Daily threat briefing" in subscribed_products:
         for briefing in list_briefings():
             if getattr(briefing, "review_state", "") != BRIEFING_REVIEW_PUBLISHED:
@@ -3941,7 +4067,7 @@ def products_for_stakeholder(stakeholder, pirs, girs, limit=20):
     deduped = []
     seen = set()
     for item in sorted(matches, key=lambda r: (r.date or ""), reverse=True):
-        if item.uuid in seen:
+        if item.uuid in seen or item.uuid not in changed_since:
             continue
         seen.add(item.uuid)
         deduped.append(item)
@@ -3965,9 +4091,8 @@ FIA_REVIEW_STATES = [
 ]
 
 FIA_AUDIENCES = list(STAKEHOLDER_ROLES)
-FIA_TLP_LEVELS = ["clear", "green", "amber", "amber+strict", "red"]
 # Least to most restrictive, so a clearance covers every level at or below its own.
-_TLP_RANK = {level: i for i, level in enumerate(FIA_TLP_LEVELS)}
+_TLP_RANK = {level: i for i, level in enumerate(TLP_LEVELS)}
 FIA_RELIABILITIES = ["A", "B", "C", "D", "E", "F"]
 FIA_CREDIBILITIES = ["1", "2", "3", "4", "5", "6"]
 
@@ -4203,6 +4328,9 @@ def format_event_attributes_text(event) -> str:
 
     report_texts = []
     for r in live_reports(event):
+        # A lookup lists other events, whatever their TLP: not story text.
+        if (getattr(r, "name", "") or "").startswith(LOOKUP_REPORT_PREFIX):
+            continue
         content = (getattr(r, "content", "") or "").strip()
         if content:
             report_texts.append(content)
@@ -4652,19 +4780,20 @@ def _fill_manual_collection_event(misp, created, data: dict, info: str) -> None:
 
     summary = (data.get("summary") or "").strip()
     if summary:
-        add_ai_summary_report(misp, created.id, info or "Manual entry", summary)
+        add_own_report(misp, created.id, info or "Manual entry", summary)
 
 
-def add_ai_summary_report(misp, event_id, title: str, summary: str, distribution: int = 5,
-                          prefix: str = AI_SUMMARY_PREFIX) -> None:
-    """Add an AI summary to an event as a report named by ``prefix``, which is
-    how the collection page and the briefing recognise one."""
+def add_own_report(misp, event_id, title: str, content: str, distribution: int = 5,
+                   prefix: str = AI_SUMMARY_PREFIX) -> None:
+    """Add a report zsazsa wrote to an event, named by ``prefix``, which is how
+    the collection page and the briefing tell it from the article: an AI
+    summary, or with LOOKUP_REPORT_PREFIX an indicator lookup."""
     from pymisp import MISPEventReport
     report = MISPEventReport()
     report.name = f"{prefix} {title[:80]}"
-    report.content = summary
+    report.content = content
     report.distribution = distribution
-    _check(misp.add_event_report(event_id, report), "add AI summary report")
+    _check(misp.add_event_report(event_id, report), f"add {prefix} report")
 
 
 NEWSLETTER_PENDING_TAG = 'zsazsa:newsletter-status="pending-review"'
@@ -5511,17 +5640,17 @@ FIA_ASSESSMENT_FIELDS = [
     ("likely_impact", "Likely impact"),
     ("affected_assets", "Affected assets"),
     ("actor_types", "Threat actor types"),
-    ("actor_context", "Threat actor context"),
 ]
 
 
 def fia_assessment_rows(fia):
     """Return the (label, value) pairs of "Why it matters" that were filled in.
 
-    An assessment left blank says nothing, so it is dropped rather than carried
+    An assessment left blank says nothing, so it is dropped rather than shown
     as "unspecified". The alert page, the review queue, the PDF and the markdown
-    every notification is built from all show the same four, so they decide what
-    to leave out here rather than each repeating the rule.
+    every notification is built from all show the same three, so they decide
+    what to leave out here rather than each repeating the rule. The threat actor
+    context is Markdown, so each of them shows it as a block of its own.
     """
     rows = []
     for field, label in FIA_ASSESSMENT_FIELDS:
@@ -5554,14 +5683,18 @@ def render_fia_markdown(fia, fia_id=None, include_source_links=False, preview_ur
     source_refs = source_event_urls(source_uuids, source_hints)
     source_links = source_event_link_urls(source_uuids, source_hints) if include_source_links else []
 
-    # The write-up is markdown the analyst wrote, and follows the bullets it
-    # expands on. With neither, the section has nothing to say and is dropped.
+    # The threat actor context and the write-up are markdown the analyst wrote,
+    # and follow the bullets they expand on. With none of them, the section has
+    # nothing to say and is dropped. Their headings go under its own.
     why_it_matters = [f"- **{label}:** {value}" for label, value in fia_assessment_rows(fia)]
+    actor_context = (fia.actor_context or "").strip()
+    if actor_context:
+        why_it_matters += ["", "**Threat actor context:**", "", nest_headings(actor_context)]
     write_up = (fia.write_up or "").strip()
     if write_up:
         if why_it_matters:
             why_it_matters.append("")
-        why_it_matters.append(write_up)
+        why_it_matters.append(nest_headings(write_up))
     why_it_matters_section = (
         ["## Why it matters", "", *why_it_matters, "", "---", ""] if why_it_matters else []
     )
@@ -5579,7 +5712,7 @@ def render_fia_markdown(fia, fia_id=None, include_source_links=False, preview_ur
         "",
         "## Summary",
         "",
-        fia.summary or "_No summary provided._",
+        nest_headings(fia.summary) or "_No summary provided._",
         "",
         f"**Action required:** {fia.action_required or '_To be defined._'}",
         "",
@@ -5587,7 +5720,7 @@ def render_fia_markdown(fia, fia_id=None, include_source_links=False, preview_ur
         "",
         "## What happened",
         "",
-        bullets(fia.what_happened),
+        nest_headings("\n".join(fia.what_happened or [])) or "_None recorded._",
         "",
         f"**Source:** {fia.source_description or 'unspecified'}",
         f"**Source reliability:** {fia.source_reliability or 'F'}",
@@ -5657,7 +5790,7 @@ def render_fia_markdown(fia, fia_id=None, include_source_links=False, preview_ur
         ])
     intelligence_gaps = (getattr(fia, "intelligence_gaps", "") or "").strip()
     if intelligence_gaps:
-        parts.extend(["", "---", "", "## Intelligence gaps", "", intelligence_gaps])
+        parts.extend(["", "---", "", "## Intelligence gaps", "", nest_headings(intelligence_gaps)])
     if fia.feedback_deadline:
         parts.extend([
             "",
@@ -5674,30 +5807,28 @@ def render_fia_markdown(fia, fia_id=None, include_source_links=False, preview_ur
     return "\n".join(parts)
 
 
-def _delete_fia_reports(misp, event):
-    """Remove rendered FIA reports (name starts with 'FIA-') from the event.
+def _delete_product_reports(misp, event, prefix):
+    """Remove a product's rendered reports, named after its id ("FIA-", "VEA-",
+    "DER-"), from its event.
 
     Hard-delete: a soft delete leaves the report attached with deleted=True,
     where it would linger and accumulate on every re-render.
     """
     for r in getattr(event, "event_reports", []) or []:
-        if getattr(r, "deleted", False):
-            continue
-        name = getattr(r, "name", "") or ""
-        if name.startswith("FIA-"):
+        if not getattr(r, "deleted", False) and (getattr(r, "name", "") or "").startswith(prefix):
             try:
                 misp.delete_event_report(r.id, hard=True)
             except Exception as exc:
                 logger.warning("delete event report %s failed: %s", r.id, exc)
 
 
-def _write_fia_report(misp, event_uuid, fia_id, content):
+def _write_product_report(misp, event_uuid, product_id, content):
     from pymisp import MISPEventReport
     er = MISPEventReport()
-    er.name = fia_id
+    er.name = product_id
     er.content = content
     er.distribution = 0
-    _check(misp.add_event_report(event_uuid, er), "add FIA report")
+    _check(misp.add_event_report(event_uuid, er), f"add {product_id} report")
 
 
 def list_fias(review_state=None, strict=False):
@@ -5780,7 +5911,7 @@ def create_fia(data, creator=""):
     try:
         _check(misp.add_object(_event_ref(result), _fia_obj(data)), "add FIA object")
         fia = _fia_ns(_check(misp.get_event(uuid, pythonify=True), "read the new FIA"))
-        _write_fia_report(misp, uuid, fia_id, render_fia_markdown(fia, fia_id))
+        _write_product_report(misp, uuid, fia_id, render_fia_markdown(fia, fia_id))
     except Exception:
         _delete_unfinished(misp, uuid, "FIA")
         raise
@@ -5839,9 +5970,9 @@ def update_fia(uuid, data, approver=""):
 
     # Re-render report
     refreshed = misp.get_event(uuid, pythonify=True)
-    _delete_fia_reports(misp, refreshed)
+    _delete_product_reports(misp, refreshed, "FIA-")
     fia = _fia_ns(refreshed)
-    _write_fia_report(misp, uuid, fia_id, render_fia_markdown(fia, fia_id))
+    _write_product_report(misp, uuid, fia_id, render_fia_markdown(fia, fia_id))
     _retag_product_sources("flash-intel", before, _sources_of(fia), flash_intel_source_uuids)
     return uuid, fia_id
 
@@ -6340,42 +6471,6 @@ def recipient_preview(product_type: str, tlp: str, audience_str: str) -> list:
     return result
 
 
-def export_focus_points_to_file():
-    """Build focus points from active PIR/GIR requirements.
-
-    Maps focus point categories to the organisation-wide keys used by AI helpers:
-      Geography  -> geographies
-      Sector     -> sectors
-      Technology -> technologies
-      Threat Type -> threat_types
-      Threat Actor -> threat_actors
-    """
-    cat_map = {
-        "Geography": "geographies",
-        "Sector": "sectors",
-        "Technology": "technologies",
-        "Threat Type": "threat_types",
-        "Threat Actor": "threat_actors",
-    }
-    result = {v: [] for v in cat_map.values()}
-    seen = {v: set() for v in cat_map.values()}
-
-    for req in list_pirs() + list_girs():
-        if getattr(req, "status", "") == "Retired":
-            continue
-        for fp in getattr(req, "focus_points", []):
-            key = cat_map.get(fp.category)
-            if not key:
-                continue
-            v = (fp.value or "").strip()
-            if v and v.lower() not in seen[key]:
-                seen[key].add(v.lower())
-                result[key].append(v)
-
-    logger.info("focus points rebuilt from requirements: %s", {k: len(v) for k, v in result.items()})
-    return result
-
-
 # ── Vulnerability Exploitation Advisory (VEA) ────────────────────────────────
 
 
@@ -6566,7 +6661,7 @@ def render_vea_markdown(vea, vea_id=None, preview_url: str = ""):
         "",
         "## Summary",
         "",
-        vea.summary or f"{vea.cve_id or 'This vulnerability'} affects {vea.affected_product or 'affected product'}.",
+        nest_headings(vea.summary) or f"{vea.cve_id or 'This vulnerability'} affects {vea.affected_product or 'affected product'}.",
         "",
         "---",
         "",
@@ -6609,7 +6704,7 @@ def render_vea_markdown(vea, vea_id=None, preview_url: str = ""):
         "",
         "### Immediate",
         "",
-        bullets(vea.immediate_actions),
+        nest_headings("\n".join(vea.immediate_actions or []), levels=3) or "- (none recorded)",
         "",
         "### Patch timeline",
         "",
@@ -6650,29 +6745,6 @@ def render_vea_markdown(vea, vea_id=None, preview_url: str = ""):
     if preview_url:
         lines += ["", f"[Open advisory]({preview_url})"]
     return "\n".join(lines)
-
-
-def _delete_vea_reports(misp, event):
-    """Hard-delete: a soft delete leaves the report attached with deleted=True,
-    where it would linger and accumulate on every re-render."""
-    for r in getattr(event, "event_reports", []) or []:
-        if getattr(r, "deleted", False):
-            continue
-        name = getattr(r, "name", "") or ""
-        if name.startswith("VEA-"):
-            try:
-                misp.delete_event_report(r.id, hard=True)
-            except Exception as exc:
-                logger.warning("delete VEA report %s failed: %s", r.id, exc)
-
-
-def _write_vea_report(misp, event_uuid, vea_id, content):
-    from pymisp import MISPEventReport
-    er = MISPEventReport()
-    er.name = vea_id
-    er.content = content
-    er.distribution = 0
-    _check(misp.add_event_report(event_uuid, er), "add VEA report")
 
 
 def list_veas(review_state=None, strict=False):
@@ -6721,7 +6793,7 @@ def create_vea(data):
     try:
         _check(misp.add_object(_event_ref(result), _vea_obj(data)), "add VEA object")
         vea = _vea_ns(_check(misp.get_event(uuid, pythonify=True), "read the new VEA"))
-        _write_vea_report(misp, uuid, vea_id, render_vea_markdown(vea, vea_id))
+        _write_product_report(misp, uuid, vea_id, render_vea_markdown(vea, vea_id))
     except Exception:
         _delete_unfinished(misp, uuid, "VEA")
         raise
@@ -6763,9 +6835,9 @@ def update_vea(uuid, data):
     _sync_tlp_tag(misp, event, _obj_attr(obj, "tlp"))
 
     refreshed = misp.get_event(uuid, pythonify=True)
-    _delete_vea_reports(misp, refreshed)
+    _delete_product_reports(misp, refreshed, "VEA-")
     vea = _vea_ns(refreshed)
-    _write_vea_report(misp, uuid, vea_id, render_vea_markdown(vea, vea_id))
+    _write_product_report(misp, uuid, vea_id, render_vea_markdown(vea, vea_id))
     _retag_product_sources("vea", before, _sources_of(vea), vea_source_uuids)
     return uuid, vea_id
 
@@ -6977,6 +7049,10 @@ def render_der_markdown(der, der_id=None, preview_url: str = ""):
     def bullets(items):
         return "\n".join(f"- {ln}" for ln in items) if items else "- (none recorded)"
 
+    # Markdown, or one item per line for a request saved before it was.
+    def markdown_items(lines):
+        return nest_headings(markdown_list(lines)) or "- (none recorded)"
+
     lines = [
         f"# Detection engineering request: {der.title or did}",
         "",
@@ -6993,7 +7069,7 @@ def render_der_markdown(der, der_id=None, preview_url: str = ""):
         "",
         "## Trigger / hypothesis",
         "",
-        der.hypothesis or "_To be defined._",
+        nest_headings(der.hypothesis) or "_To be defined._",
         "",
         "---",
         "",
@@ -7011,13 +7087,13 @@ def render_der_markdown(der, der_id=None, preview_url: str = ""):
     lines += [
         "## Log sources",
         "",
-        bullets(der.log_sources),
+        markdown_items(der.log_sources),
         "",
         "---",
         "",
         "## Expected rule output",
         "",
-        der.expected_output or "_To be defined._",
+        nest_headings(der.expected_output) or "_To be defined._",
         "",
         "---",
         "",
@@ -7029,7 +7105,7 @@ def render_der_markdown(der, der_id=None, preview_url: str = ""):
         "",
         "## Test cases",
         "",
-        bullets(der.test_cases),
+        markdown_items(der.test_cases),
     ]
     if der.draft_rule:
         lines += [
@@ -7045,26 +7121,6 @@ def render_der_markdown(der, der_id=None, preview_url: str = ""):
     if preview_url:
         lines += ["", "---", "", f"[Open request]({preview_url})"]
     return "\n".join(lines)
-
-
-def _delete_der_reports(misp, event):
-    for r in getattr(event, "event_reports", []) or []:
-        if getattr(r, "deleted", False):
-            continue
-        if (getattr(r, "name", "") or "").startswith("DER-"):
-            try:
-                misp.delete_event_report(r.id, hard=True)
-            except Exception as exc:
-                logger.warning("delete DER report %s failed: %s", r.id, exc)
-
-
-def _write_der_report(misp, event_uuid, der_id, content):
-    from pymisp import MISPEventReport
-    er = MISPEventReport()
-    er.name = der_id
-    er.content = content
-    er.distribution = 0
-    _check(misp.add_event_report(event_uuid, er), "add DER report")
 
 
 def _der_source_uuids() -> set:
@@ -7116,7 +7172,7 @@ def create_der(data):
     try:
         _check(misp.add_object(_event_ref(result), _der_obj(data)), "add DER object")
         der = _der_ns(_check(misp.get_event(uuid, pythonify=True), "read the new DER"))
-        _write_der_report(misp, uuid, der_id, render_der_markdown(der, der_id))
+        _write_product_report(misp, uuid, der_id, render_der_markdown(der, der_id))
     except Exception:
         _delete_unfinished(misp, uuid, "DER")
         raise
@@ -7153,9 +7209,9 @@ def update_der(uuid, data):
     _sync_tlp_tag(misp, event, _obj_attr(obj, "tlp"))
 
     refreshed = misp.get_event(uuid, pythonify=True)
-    _delete_der_reports(misp, refreshed)
+    _delete_product_reports(misp, refreshed, "DER-")
     der = _der_ns(refreshed)
-    _write_der_report(misp, uuid, der_id, render_der_markdown(der, der_id))
+    _write_product_report(misp, uuid, der_id, render_der_markdown(der, der_id))
     _retag_product_sources("detection-eng-request", before, _sources_of(der), _der_source_uuids)
     return uuid, der_id
 
@@ -7864,6 +7920,9 @@ def scraper_existing_uuids(uuids):
 def _event_text(ev):
     parts = [ev.info or ""]
     for r in getattr(ev, "event_reports", []) or []:
+        # A lookup lists other events: their titles are not this event's text.
+        if (getattr(r, "name", "") or "").startswith(LOOKUP_REPORT_PREFIX):
+            continue
         if getattr(r, "name", None):
             parts.append(r.name)
         if getattr(r, "content", None):
@@ -7976,7 +8035,6 @@ TLR_NEXT_STATES = {
 # it back to draft first.
 TLR_LOCKED_STATES = (TLR_REVIEW_APPROVED, TLR_REVIEW_PUBLISHED)
 
-TLR_TLP_LEVELS = ["clear", "green", "amber", "amber+strict", "red"]
 
 # Form field, label and icon of the actor categories under trending threat actors.
 # The MISP attribute is the field name with hyphens.
@@ -8161,6 +8219,10 @@ def _tlr_ns(event):
 _RELEVANCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
+# What an incident takes from the first of its events that has it.
+_INCIDENT_FIRST = ("threat_type", "source_reliability", "information_credibility", "impact", "affected_assets")
+
+
 def tlr_incidents(entries) -> list:
     """The incidents among the entries left in the analysis, which the counts
     of a report are of: the events an analyst grouped as one incident merged,
@@ -8180,24 +8242,18 @@ def tlr_incidents(entries) -> list:
     incidents = []
     for members in groups.values():
         members.sort(key=lambda e: e.event_date or "9999")
-
-        def first(attr):
-            return next((getattr(m, attr) for m in members if getattr(m, attr)), "")
-
-        def every(attr):
-            return list(dict.fromkeys(v for m in members for v in getattr(m, attr)))
-
         relevance = min((m.relevance for m in members if m.relevance in _RELEVANCE_ORDER),
                         key=_RELEVANCE_ORDER.get, default="")
         lead = members[0]
         incidents.append(SimpleNamespace(
             event_uuid=lead.event_uuid, event_info=lead.event_info, event_date=lead.event_date,
-            source_id=lead.source_id, relevance=relevance, threat_type=first("threat_type"),
-            source_reliability=first("source_reliability"), information_credibility=first("information_credibility"),
-            impact=first("impact"), affected_assets=first("affected_assets"),
-            **{key: every(key) for key in TLR_ENTRY_LISTS}, events=len(members),
-            event_uuids=[m.event_uuid for m in members], source_ids=list(dict.fromkeys(m.source_id for m in members))))
+            source_id=lead.source_id, relevance=relevance,
+            **{key: next((getattr(m, key) for m in members if getattr(m, key)), "") for key in _INCIDENT_FIRST},
+            **{key: list(dict.fromkeys(v for m in members for v in getattr(m, key))) for key in TLR_ENTRY_LISTS},
+            events=len(members), event_uuids=[m.event_uuid for m in members],
+            source_ids=list(dict.fromkeys(m.source_id for m in members))))
     return incidents
+
 
 
 def tlr_annex(tlr):
@@ -8260,7 +8316,7 @@ def render_tlr_markdown(tlr, linked_pirs=(), preview_url="", ranking=(), vulnera
     if tlr.executive_summary or tlr.key_judgements:
         lines += ["## Executive summary", ""]
         if tlr.executive_summary:
-            lines += [tlr.executive_summary, ""]
+            lines += [nest_headings(tlr.executive_summary), ""]
         for kj in tlr.key_judgements:
             confidence = f" ({labels.get(kj.get('confidence'), kj.get('confidence'))} confidence)" \
                 if kj.get("confidence") else ""
@@ -8309,9 +8365,9 @@ def render_tlr_markdown(tlr, linked_pirs=(), preview_url="", ranking=(), vulnera
             lines.append(f"- **{r['cve']}**{': ' + ', '.join(facts) if facts else ''}")
         lines.append("")
     if tlr.purpose:
-        lines += ["## Purpose", "", tlr.purpose, ""]
+        lines += ["## Purpose", "", nest_headings(tlr.purpose), ""]
     if tlr.top_threats:
-        lines += ["## Top threats", "", tlr.top_threats, ""]
+        lines += ["## Top threats", "", nest_headings(tlr.top_threats), ""]
 
     for section in tlr.threat_sections:
         lines += [f"## {section.get('title') or section.get('threat_type') or 'Threat assessment'}", ""]
@@ -8322,17 +8378,17 @@ def render_tlr_markdown(tlr, linked_pirs=(), preview_url="", ranking=(), vulnera
             lines += [" | ".join(facts), ""]
         for key, heading in TLR_SECTION_TEXTS:
             if section.get(key):
-                lines += [f"### {heading}", "", section[key], ""]
+                lines += [f"### {heading}", "", nest_headings(section[key], levels=3), ""]
 
-    categories = [f"### {label}\n\n{getattr(tlr, key, '')}" for key, label, _icon in TLR_ACTOR_CATEGORIES
-                  if getattr(tlr, key, "")]
-    actors = "\n\n".join(([tlr.trending_actors] if tlr.trending_actors else []) + categories)
+    categories = [f"### {label}\n\n{nest_headings(getattr(tlr, key, ''), levels=3)}"
+                  for key, label, _icon in TLR_ACTOR_CATEGORIES if getattr(tlr, key, "")]
+    actors = "\n\n".join(([nest_headings(tlr.trending_actors)] if tlr.trending_actors else []) + categories)
     sections = [
         ("Trending threat actors", actors),
-        ("Key incidents", tlr.key_incidents),
-        ("Recommendations", tlr.recommendations),
-        ("Outlook", tlr.outlook),
-        ("Methodology and limitations", tlr.methodology),
+        ("Key incidents", nest_headings(tlr.key_incidents)),
+        ("Recommendations", nest_headings(tlr.recommendations)),
+        ("Outlook", nest_headings(tlr.outlook)),
+        ("Methodology and limitations", nest_headings(tlr.methodology)),
         ("Dataset", "\n".join(f"- **{label}:** {value}" for label, value in tlr_annex(tlr))),
         ("Corrections", "\n".join(f"- {c['date']}: {c['text']}" for c in tlr.corrections)),
     ]

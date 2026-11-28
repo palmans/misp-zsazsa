@@ -1,6 +1,7 @@
 """Vulnerability Exploitation Advisory (VEA) routes."""
 
 import logging
+import re
 from types import SimpleNamespace
 
 import config as _cfg
@@ -20,7 +21,7 @@ from webapp.routes.source_event_utils import (
 )
 from webapp.routes import data_collection
 from webapp import audit, branding, collection_cache, misp_session, misp_store, notify_jobs, product_log
-from webapp.models import STAKEHOLDER_ROLES
+from webapp.models import STAKEHOLDER_ROLES, TLP_LEVELS
 from webapp.utils import TLP_NAMES, matching, md_to_html, ordered_counts, sort_products, tlp_counts, tlp_of
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,8 @@ def _form_data(form, vea_id=""):
 
     return {
         "vea_id": vea_id,
-        "cve_id": ", ".join(l.strip() for l in form.get("cve_id", "").splitlines() if l.strip()),
+        # One line, the IDs apart by commas, spaces or semicolons.
+        "cve_id": ", ".join(cve for cve in re.split(r"[\s,;]+", form.get("cve_id", "")) if cve),
         "summary": form.get("summary", "").strip(),
         "cvss": form.get("cvss", "").strip(),
         "cwe": form.get("cwe", "").strip(),
@@ -61,7 +63,8 @@ def _form_data(form, vea_id=""):
         "information_credibility": form.get("information_credibility", ""),
         "worst_case": form.get("worst_case", ""),
         "most_likely": form.get("most_likely", ""),
-        "immediate_actions": misp_store._split_lines(form.get("immediate_actions")),
+        # Markdown, kept line for line as written.
+        "immediate_actions": (form.get("immediate_actions") or "").strip().splitlines(),
         "patch_sla_internet": form.get("patch_sla_internet", ""),
         "patch_sla_internal": form.get("patch_sla_internal", ""),
         "target_patch_version": form.get("target_patch_version", ""),
@@ -82,7 +85,7 @@ def _wizard_context(vea=None, source_events=None):
     return {
         "vea": vea,
         "audiences": misp_store.FIA_AUDIENCES,
-        "tlp_levels": misp_store.FIA_TLP_LEVELS,
+        "tlp_levels": TLP_LEVELS,
         "reliabilities": misp_store.FIA_RELIABILITIES,
         "credibilities": misp_store.FIA_CREDIBILITIES,
         "review_states": misp_store.VEA_REVIEW_STATES,
@@ -395,7 +398,7 @@ def _build_seed_from_sources(source_uuids, source_pairs, source_events):
 
     return SimpleNamespace(
         vea_id="",
-        cve_id="\n".join(cve_ids),
+        cve_id=", ".join(cve_ids),
         title=first_title,
         summary="", cvss="", cwe="",
         tlp="amber", author="", audience="",
@@ -612,7 +615,7 @@ def pdf(id):
         pdf_bytes = weasyprint.HTML(string=html).write_pdf()
     except Exception as exc:
         logger.warning("pdf: weasyprint failed for VEA %s: %s", id, exc)
-        return f"PDF generation failed: {exc}", 500
+        return "The PDF could not be made.", 500
     filename = f"{vea.vea_id}.pdf"
     return Response(
         pdf_bytes,
