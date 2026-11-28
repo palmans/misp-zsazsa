@@ -1,11 +1,6 @@
 # Deployment overrides for zsazsa/docker, loaded through COMPOSE_FILE in
 # zsazsa/docker/.env (written by scripts/init.sh), after
 # docker-compose.misp-docker.yml has put the containers on misp-docker's network.
-x-misp-via-proxy: &misp-via-proxy
-  # MISP's public address resolves to the reverse proxy, with or without DNS.
-  extra_hosts:
-    - "${MISP_HOSTNAME:?Missing MISP_HOSTNAME in .env, run scripts/init.sh}:${PROXY_IP:?Missing PROXY_IP in .env, run scripts/init.sh}"
-
 x-timezone: &timezone
   # Log times in local time. The slim Python images have no time zone data of
   # their own, so the host's is used.
@@ -14,17 +9,31 @@ x-timezone: &timezone
   volumes:
     - "/usr/share/zoneinfo:/usr/share/zoneinfo:ro"
 
+# zsazsa's own containers: the time zone as above, and more. YAML merges keys
+# whole, so environment and volumes repeat the ones of *timezone.
+x-zsazsa: &zsazsa
+  # MISP's public address resolves to the reverse proxy, with or without DNS.
+  extra_hosts:
+    - "${MISP_HOSTNAME:?Missing MISP_HOSTNAME in .env, run scripts/init.sh}:${PROXY_IP:?Missing PROXY_IP in .env, run scripts/init.sh}"
+  environment:
+    TZ: "${TZ:-UTC}"
+    # Loads deploy/python/sitecustomize.py: no PyMISP version warning per call.
+    PYTHONPATH: /opt/deploy-python
+  volumes:
+    - "/usr/share/zoneinfo:/usr/share/zoneinfo:ro"
+    - "../../deploy/python:/opt/deploy-python:ro"
+
 services:
   webapp:
-    <<: [*misp-via-proxy, *timezone]
+    <<: *zsazsa
     # Reached only by misp-nginx, as http://zsazsa:5000 on misp-docker's network.
     ports: !reset []
 
   analyser:
-    <<: [*misp-via-proxy, *timezone]
+    <<: *zsazsa
 
   imap-collector:
-    <<: [*misp-via-proxy, *timezone]
+    <<: *zsazsa
 
   # on-failure is not restarted when the Docker host reboots.
   scraper-subscribe:

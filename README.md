@@ -64,6 +64,7 @@ The three folders `misp-docker/`, `misp-scraper/` and `zsazsa/` are copies of th
 | `deploy/settings.env` | **Your** site settings | no |
 | `deploy/misp-docker.override.yml` | Compose override for misp-docker: no host ports, LAN address, configurable ports, zsazsa route | yes |
 | `deploy/zsazsa.override.yml` | Compose override for zsazsa: no host ports, MISP reached through the proxy, restart policy | yes |
+| `deploy/python/sitecustomize.py` | Drops PyMISP's "recommended version is newer" warning in zsazsa's containers (zsazsa pins PyMISP below 3 on purpose) | yes |
 | `deploy/nginx/05-zsazsa.sh` | Adds the `/zsazsa/` location, and the return to zsazsa after a MISP login, to misp-nginx on every start | yes |
 | `deploy/misp/customize_misp.sh` | Runs in misp-core on every start: `Security.force_https`, mail signing, default distribution, PHP session hardening | yes |
 | `deploy/misp/post_install.py` | Taxonomies, users and API keys through MISP's API; run by `scripts/post-install.sh` | yes |
